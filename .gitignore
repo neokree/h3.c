@@ -1,7 +1,11 @@
 # Local models, references, experiments, and generated media.
 misc/
+MiniMax-H3
 MiniMax-H3/
 outputs/
+logs/
+refs/
+prompts/
 .ruff_cache/
 
 # Compiler and test outputs.
@@ -28,3 +32,6 @@ h3_real_video_vae_test
 h3_semantic_vae_test
 libh3.a
 .DS_Store
+
+# Agent scratch.
+.claude/
