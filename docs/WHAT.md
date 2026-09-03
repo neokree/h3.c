@@ -174,6 +174,53 @@ lo streaming. Lettura completa in `docs/research/llama-cpp-adapters.md`.
 
 ---
 
+## 6ter. Superficie API
+
+Il contratto pubblico è **solo** `h3_params` più due funzioni. Non esiste un tipo
+opaco che il chiamante possieda: gli adapter vivono nella cache di `h3_ctx`.
+
+1. **Dichiarativa, non a handle.** `h3_params` porta
+   `const h3_lora *loras; size_t lora_count;` con
+   `h3_lora = { const char *path; float strength; }`, nello stesso modo in cui
+   `h3_reference` porta già un path. Niente da liberare per il chiamante,
+   quindi la domanda "un adapter può sopravvivere al modello" non si pone.
+2. **`h3_lora.h` è interno**, non fa parte del contratto di `libh3.a`. La
+   superficie pubblica minima lascia libere le mani a G4.
+3. **Validazione contro gli header, subito.**
+   `h3_lora_preload(ctx, path, cb, opaque)` confronta l'header safetensors del
+   LoRA con gli header degli shard del transformer, **senza leggere un byte di
+   peso**. Il report esce quindi prima dei 62 GiB, e `!lora add` risponde
+   nell'istante in cui lo digiti invece che alla generazione successiva.
+4. **Report su callback.**
+   `typedef int (*h3_report_callback)(const char *line, void *opaque)`, stessa
+   forma di `h3_progress_callback`. La libreria non stampa da sé: chi integra
+   `libh3.a` decide dove finisce il testo, e H5 esige che si veda.
+5. **Chiave di cache: path più dimensione più mtime** (`stat`). Un file
+   sovrascritto allo stesso path viene ricaricato invece di restare quello
+   vecchio in memoria senza dirlo.
+6. **Un caso fatale ferma la generazione.** `h3_generate` fallisce e il
+   messaggio esce da `h3_last_error`. Non si consegna mai un video privo del
+   LoRA richiesto: a tredici minuti per run, non c'è modo di accorgersene
+   guardandolo. Vale solo per i due casi fatali di sezione 3 punto 3.
+7. **`h3_lora_release(ctx, path)`** libera una singola voce di cache, che è
+   quello che serve a `!lora remove` senza svuotare anche il DiT preparato.
+8. **L'insieme attivo si sostituisce in blocco** a ogni generazione, perché vive
+   in `h3_params`. `!lora add|set|remove` è editing della lista nello stato
+   della sessione (`h3_cli.c:28`, copiata per generazione a `h3_cli.c:434`), non
+   una API incrementale. Una strength nuova non ricarica niente: la porta il
+   params, l'adapter in cache non la conosce.
+
+Due conseguenze da non perdere:
+
+- **Su H4**: le voci a strength 0 vanno scartate mentre si costruisce l'insieme
+  attivo, così il loop di dispatch è identico a quello senza LoRA **per
+  costruzione** e non per fortuna.
+- **Su 7bis.2 e 7bis.3**: il trigger di ricalcolo di refiner e schedule AdaLN è
+  "la lista LoRA di questo `h3_params` differisce da quella con cui la cache è
+  stata calcolata". Il dettaglio è deciso a parte.
+
+---
+
 ## 7. Modello dati
 
 Contratto intoccabile. Nomi e forme rilevati dal file di prova e dal checkpoint
