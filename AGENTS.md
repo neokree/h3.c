@@ -74,8 +74,22 @@ lenta rispetto all'SSD che il prefetch copre tutto. Senza streaming il DiT
 vuole ~37 GiB residenti su 48 totali con working set raccomandato di 36: va
 in swap. Non c'è motivo di spegnerlo.
 
-Picchi di memoria reali: DiT 2,58 GiB, **video VAE decoder 9,37 GiB** ← il più
-alto della pipeline, è lui il limite se sali di risoluzione, non i pesi.
+Picchi di memoria a `448x576`, 56 frame: DiT 2,58 GiB, **video VAE decoder
+9,37 GiB**, il più alto dei singoli stage. Ma il decoder è **tiled**
+(`run_resident_tile`, `h3_video_vae.c:532`): il picco dipende dal tile, non
+dall'output, e a `768x1344` sale solo a 9,55 GiB, il 2% in più con 4x i pixel.
+**Non è lui il limite quando alzi la risoluzione.**
+
+Quello che scala è il **footprint di processo durante il denoise**: 8,92 GB a
+`448x576`/56 frame, **22,5 GB a `768x1344`/22 frame**. Il contatore `peak=` di h3
+riporta 2,58 GiB in entrambi i run, uguale a quattro cifre: conta solo i due slot
+dei pesi, che per costruzione non dipendono dalla risoluzione. I ~20 GB che ne
+dipendono (attivazioni, working set dell'attention, workspace MPSGraph) stanno
+fuori da `h3_gpu_stats`. **Non usare `peak=` per stimare quanta memoria resta**,
+misura `footprint -p <pid>`.
+
+Gli step non toccano la memoria: `alloc=0.000GiB` sull'intero loop di denoise in
+entrambi i run. Il loop riusa gli stessi buffer allocati al load.
 
 ## Modello di costo (misurato, M4 Pro)
 
@@ -100,9 +114,11 @@ Come stimare un run nuovo:
 Esempio: 39 frame, layers 50, 20 valutazioni → `0,82 × 39 × 1 = 32 s/val`
 → `32 × 20 = 640 s` + ~60 s = **~11,7 min**.
 
-La risoluzione alza solo il tempo GPU, **non** il costo di streaming: i pesi
-letti per valutazione sono gli stessi. Su questa macchina l'unica leva che
-taglia davvero il tempo è ridurre le valutazioni.
+La risoluzione alza il tempo GPU **e la memoria** (8,92 GB → 22,5 GB, vedi
+sopra), ma **non** il costo di streaming: i pesi letti per valutazione sono gli
+stessi, misurati a 35,9 GiB/valutazione a `448x576` e 36,1 a `768x1344`. Su
+questa macchina l'unica leva che taglia davvero il tempo è ridurre le
+valutazioni.
 
 ## Ordine di priorità sulla qualità
 
