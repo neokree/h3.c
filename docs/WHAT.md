@@ -123,8 +123,50 @@ La `strength` dell'utente moltiplica quel fattore, non lo sostituisce.
 Uso reale della `strength`, dichiarato dal proprietario: **con segno**, in
 `[-2, 2]`, e nel 90% dei casi fra 0,6 e 0,7. La strength 100 di T1 (sezione 8) è
 quindi uno strumento di misura 50 volte fuori dall'intervallo di produzione, non
-un regime supportato. Il dominio ammesso, cioè se e dove si validano estremi e
-segno, è deciso separatamente.
+un regime supportato. **Dominio della `strength`: qualunque valore finito, nessun estremo.** Nessun
+tetto superiore e nessun pavimento inferiore. Un tetto obbligherebbe a scegliere
+un numero indifendibile fra la produzione (2) e T1 (100), e un valore enorme non
+rompe niente: bf16 ha lo stesso range di esponente del float32, quindi non c'è
+overflow, esce solo un video sbagliato. Nemmeno un avviso sopra una soglia:
+l'errore realistico è `:10` al posto di `:1.0`, che sta a 5x dalla produzione,
+quindi una soglia bassa abbastanza da prenderlo urlerebbe su ogni run di T1, e
+una alta abbastanza da tacere su T1 non lo prende mai. La strength effettiva è
+già stampata nel report di attivazione (sezione 5), che è dove l'utente verifica
+cosa ha chiesto.
+
+**Si rifiuta solo ciò che non è un numero finito, e in due punti.**
+
+Al **parse della CLI**, su entrambe le superfici: spazzatura in coda
+(`:1.0abc`), stringa vuota, e `isfinite` falso (`nan`, `inf`, `-inf`). Il parse
+deve essere rigido e non indulgente: `atof("abc")` ritorna `0.0`, e la strength 0
+fa scartare l'adapter alla costruzione dell'insieme, quindi un parse permissivo
+trasformerebbe un refuso in una **LoRA sparita in silenzio**, che è esattamente
+ciò che H5 vieta. La reazione segue la convenzione della repo: one-shot stampa
+`h3: invalid ...` ed esce con `2` (`parse_int`, `main.c:66`), l'interattiva
+stampa e lascia il valore precedente (`parse_i32`, `h3_cli.c:58`). Dominio
+identico sulle due superfici, reazione diversa: non è una divergenza fra
+`--lora` e `!lora set`, è come si comportano già tutte le altre opzioni.
+
+Alla **costruzione dell'insieme attivo**, solo `isfinite`, e il fallimento è
+quello di una coppia fatale (sezione 3, punto 3). Non è ridondanza: `h3_params`
+è API pubblica (sezione 6ter) e un embedder può scriverci un `NaN` senza passare
+dalla CLI. `strtof("nan")` **riesce**, quindi la rigidità sintattica non lo
+prende; e non lo prende nemmeno lo scarto a strength 0, perché `NaN != 0`. Un
+`NaN` viene fuso dentro `A` (sezione 7bis.4), rende `NaN` l'intero delta e
+produce un video nero senza un messaggio. Precedente in casa:
+`frames_from_seconds` (`main.c:82`) fa già esattamente questo controllo.
+
+**La coda dopo l'ultimo `:` che non è un numero è un errore, non un percorso.**
+G3 divide sull'ultimo due punti, e su macOS i due punti sono legali nei nomi di
+file, quindi `refs/turbo:v2.safetensors` è un percorso possibile. Non si ricade
+sul trattare l'intera stringa come percorso a strength `1.0`: quel fallback
+renderebbe `file.safetensors:0.8x` un percorso inesistente, e l'errore mostrato
+diventerebbe "file non trovato" invece di "strength malformata", cioè punterebbe
+nel posto sbagliato. Il messaggio nomina il pezzo che non ha parsato, così anche
+chi ha davvero un due punti nel nome capisce che deve scrivere `:1.0`.
+
+**`strength 0` resta scartata, ma dichiarata** (sezione 5, punto 1). Lo scarto
+alla costruzione dell'insieme è ciò che rende H4 strutturale e non si tocca.
 
 ---
 
@@ -138,6 +180,13 @@ testuali:
    memoria occupata. Non esiste una sezione "coppie saltate": una coppia
    inapplicabile è fatale (sezione 3, punto 3) e il suo elenco esce dal messaggio
    d'errore, non dal report.
+
+   Un `--lora` a **strength 0** non sparisce dal report. L'adapter viene scartato
+   alla costruzione dell'insieme attivo, ed è così che H4 diventa strutturale, ma
+   il report ne porta comunque una riga: `stile.safetensors: strength 0, not
+   applied`. È l'unico caso in cui un LoRA richiesto esplicitamente potrebbe non
+   esserci senza che nessuno lo dica; il file viene validato lo stesso, quindi un
+   percorso sbagliato a strength 0 resta un errore e non un silenzio.
 
    **Forma della distribuzione dei ranghi**: istogramma compatto su una riga,
    ordinato per conteggio decrescente, `ranks: 64 x208, 16 x51`. Non un intervallo
