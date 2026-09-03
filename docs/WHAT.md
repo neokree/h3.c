@@ -502,24 +502,110 @@ l'insieme**, non solo il pezzo toccato.
 | G1 | `adaln_proj`: **supportato**. Non è una quinta proiezione per blocco ma un precalcolo una tantum (sezione 7bis.3), invalidato da un cambio di LoRA con lo stesso meccanismo del refiner. Non verificabile con il LoRA di riferimento, che ha le 51 coppie AdaLN rimosse. | **chiuso, supportato** |
 | G2 | `--lora` funziona **sia** in one-shot (`h3 -p ...`) **sia** in sessione interattiva. Motivo: T2 confronta due invocazioni di `h3` a parità di seed, che *è* modalità one-shot — il piano di test la richiedeva già. | **chiuso** |
 | G3 | Sintassi fissata: **`--lora PATH[:STRENGTH]`**, ripetibile, strength opzionale con default `1.0`, parsata **splittando sull'ultimo `:`**. Superficie interattiva: `!lora add PATH [STRENGTH]`, `!lora set PATH STRENGTH`, `!lora remove PATH`, `!lora` nudo elenca. Motivo: LoRA e strength non sono separabili da un errore dell'utente, a differenza di flag appaiati dove una strength omessa sposta tutti gli argomenti successivi. | **chiuso** |
-| G4 | Tetto di memoria per gli adapter residenti. **Deciso**: adapter residenti in memoria GPU, ma la struct dell'adapter porta un'indirezione `source` fin dal primo giorno, così che lo spill su SSD sia un riempimento successivo e non un refactor. Il **numero** del tetto è deliberatamente non fissato: aspetta una misura di picco RSS sotto carico reale di generazione (vedi nota sotto). | **aperto, bloccato su misura** |
+| G4 | Tetto di memoria. **Chiuso**: nessun tetto statico sugli adapter. Il tetto è sul **processo intero**, misurato e mai previsto, e al tetto h3 **si ferma**. Vale `min(recommendedMaxWorkingSetSize - 4 GiB, libera di sistema + footprint attuale)`, verificato a due cancelli, ed è **sempre attivo** anche senza LoRA: allargamento dichiarato da "tetto degli adapter" a "guardrail di memoria di h3". Dettaglio sotto. | **chiuso** |
 | G5 | I percorsi residente e int8 restano espressamente **fuori scope** (decisione di Fase 3). Da riaprire solo dopo che lo streaming funziona. | **chiuso, escluso** |
 | G6 | Budget prestazionale. Deciso in Fase 3: **non è un vincolo ora**, prima correttezza poi ottimizzazione. Il numero **non** passa da `--profile` (requisito ritirato, sezione 5 punto 3): si misura fuori banda con run A/B quando serve. | **chiuso, rimandato** |
 | G7 | Il turbo LoRA specifico funzioni o no è **irrilevante** per l'accettazione: il progetto consegna il meccanismo, non la qualità di un file di terze parti. | **chiuso, fuori scope** |
 
-### G4 — l'aritmetica già assestata
+### G4 — il guardrail di memoria
 
-Quello che **è** noto. Da `h3_dit.h:21-23`, lo streaming trattiene solo le norme
-di blocco più **due** slot BF16 alternati di matrici. Dalle forme della sezione
-7.1, uno slot vale
+**Nessun tetto statico sugli adapter.** Un numero fisso sui byte degli adapter
+non si applica alla condizione in esecuzione: la leva che muove davvero il picco
+è il canvas, e il picco di h3 **non è noto prima di girare** (il termine
+dipendente dalla risoluzione sta fuori da `h3_gpu_stats`, che riporta 2,58 GiB
+sia a `448x576` sia a `768x1344`). Quindi non si prevede, si misura.
+
+Il tetto è sul processo intero:
+
+```
+tetto_statico  = recommendedMaxWorkingSetSize - 4 GiB      /* 32 GiB qui */
+tetto_dinamico = libera_di_sistema + footprint_attuale
+tetto           = min(tetto_statico, tetto_dinamico)
+```
+
+`recommendedMaxWorkingSetSize` vale 36 GiB su questa macchina, la stessa cifra
+che LM Studio mostra come "VRAM 36.00 GB". La **riserva di 4 GiB è il solo numero
+fisso di tutto il design**, giustificata da cosa deve restare in piedi mentre h3
+tiene 22 GB (sistema, WindowServer, compressore) e non da una stima del nostro
+consumo: **nessun flag, nessun preset, nessuna sovrascrittura**.
+
+`libera_di_sistema` è `free_count + inactive_count + purgeable_count` da
+`host_statistics64(HOST_VM_INFO64)`, in `<mach/mach.h>`, zero dipendenze. Le
+pagine che un altro processo tiene `active` o `wired` (un server LLM, un altro
+modello video) non contano come libere: il termine statico è cieco a quel caso,
+il dinamico no. Il messaggio di stop nomina **quale dei due termini ha morso**,
+altrimenti l'utente non sa se chiudere l'altro processo o abbassare il canvas.
+
+**Cancello 1, pre-flight, prima di leggere qualunque byte.** Confronta il tetto
+con la somma dei soli termini noti **esattamente** e indipendenti dal canvas: i
+due slot BF16 di pesi (1,5 GB, aritmetica sotto), il decoder VAE tiled
+(9,55 GiB misurati, si muove dell'1,7% per 4x i pixel) e i byte residenti degli
+adapter, noti dagli header safetensors al preload. Con `--preview` o DiT cachato
+gli ultimi due sono concorrenti, quindi ~11 GB più adapter; altrimenti gli stage
+sono serializzati (`h3.c:1591`) e il massimo è il decoder. È una **condizione
+necessaria e non sufficiente**: il picco dello stage text encoder non è misurato
+e resta fuori dal calcolo.
+
+**Cancello 2, dopo la prima valutazione del denoiser.** Lì il footprint è a
+regime per misura (`alloc=0.000GiB` su tutto il loop di denoise). Si campiona
+`phys_footprint` con `task_info(mach_task_self(), TASK_VM_INFO, ...)`, lo stesso
+numero che legge `footprint -p` e il solo che vede il termine dipendente dalla
+risoluzione. Se il tetto è superato, si ferma. Costa una valutazione, ~45 s su un
+run da 13 minuti, e sostituisce una previsione con un fatto. È il cancello 2 che
+rende inutile un budget statico: il limite segue i tensori davvero in uso.
+
+**Al tetto si ferma, mai un set parziale.** Il set attivo è dichiarativo e
+sostituito in blocco a ogni generazione (sezione 6ter), quindi "rifiuta
+l'N-esimo" non è definito, e un adapter scartato in silenzio è ciò che **H5**
+vieta. In one-shot `h3_generate` fallisce al cancello 1, prima della lettura del
+checkpoint. In sessione il cancello rifiuta **la generazione**, non l'`!lora add`,
+la cui validità resta governata da G3 e dalla sezione 6ter.
+
+**Allocazione eager**, al preload e all'`!lora add`: è l'unico modo in cui
+"blocca subito" ha un significato. Limite noto: al momento dell'add il termine
+del canvas non è allocato, quindi un add che passa può comunque portare la
+generazione successiva in swap. È esattamente il motivo per cui esiste il
+cancello 2.
+
+**Cosa conta nel budget**: i byte **residenti** di `A` e `B` delle sole coppie
+accoppiate a un bersaglio, nel dtype residente. Le coppie riportate e saltate
+(sezione 3.3) non sono residenti. Le entry a strength 0 sono già scartate alla
+costruzione del set (sezione 6ter). Un file float32 conta il doppio: il budget
+misura byte residenti, non byte su disco.
+
+**I cancelli sono sempre attivi**, anche con set vuoto: misurano il processo
+intero, quindi un branch in meno e protezione anche nei run senza adapter, che
+sono quelli che oggi vanno in swap. Questo è un **allargamento dichiarato** di
+G4, non un effetto collaterale.
+
+**Lo spill su SSD resta un riempimento successivo**, con l'innesco ormai fissato:
+il cancello 2, mai una soglia inventata. L'indirezione `source` nella struct
+dell'adapter resta come predisposizione. Per memoria: costerebbe ~7-10 GiB di
+letture in più sui 575 GiB già letti, il ~2%, contro un `unhidden wait 0.006s`
+misurato. Poco, ma un abort è verificabile in un test e uno spill sotto pressione
+di memoria no.
+
+#### L'aritmetica di supporto
+
+Da `h3_dit.h:21-23`, lo streaming trattiene solo le norme di blocco più **due**
+slot BF16 alternati di matrici. Dalle forme della sezione 7.1, uno slot vale
 `21504·5376 + 5376·7168 + 28672·5376 + 5376·14336 = 385,4M` elementi
-≈ **771 MB** in BF16, quindi due slot ≈ **1,5 GB** residenti. La macchina ha
-48 GiB.
+≈ **771 MB** in BF16, quindi due slot ≈ **1,5 GB** residenti.
 
-Quello che **non** è noto, ed è ciò su cui G4 è bloccato: il picco di occupazione
-altrove nella pipeline. Anche la directory `text_encoder` è 62 GB su disco e
-`video_vae` è 9,7 GB; **se vengano liberati prima del loop del denoiser non è
-stato misurato**. Il tetto si fissa dopo quella misura, non prima.
+Dal lato adapter, un rank-64 a copertura piena vale
+`(64·5376 + 21504·64) + (64·7168 + 5376·64) + (64·5376 + 28672·64) + (64·14336 + 5376·64)`
+= 5,96M elementi per blocco, cioè 11,4 MiB per blocco su 52 blocchi = **591,7 MiB**,
+più ~57 MB per le 51 coppie AdaLN a rango 16. Verificato contro il file reale:
+`loras/turbo.safetensors` misura **591,6 MiB**. I LoRA per H3 sono quindi 3-4x
+quelli SDXL/Wan, perché hidden è 5376, e **4-5 adapter insieme sono 2,4-3,0 GB
+residenti**.
+
+Conseguenza da tenere presente: con tetto a 32 GiB e la configurazione peggiore
+raggiungibile (canvas massimo con `--preview` o DiT cachato, picco ~32 GB),
+l'headroom per gli adapter è **~2,2 GiB**, cioè tre adapter rank-64 pieni e non
+cinque. Quella combinazione **è attesa far scattare il cancello 2**, e fermarsi
+lì è il comportamento voluto, non un difetto. Al canvas della ricetta l'headroom
+è ~20 GiB e nulla morde.
 
 ---
 
