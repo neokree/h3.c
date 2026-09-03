@@ -35,3 +35,6 @@ libh3.a
 
 # Agent scratch.
 .claude/
+
+# Local LoRA files (symlinks to large downloads).
+loras/
