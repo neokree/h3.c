@@ -428,11 +428,37 @@ fissato da seed, e lo si confronta con il ramo LoRA sulla GPU.
 **Nessun Python nel loop di test.** **L'oracolo è per tensore, non per modello**:
 bastano pochi secondi e nessuna copia da 62 GiB.
 
-Tolleranza: l'attuale `<= 1e-3` di L2 relativo era scritta contro un oracolo a
-**peso fuso in BF16** e **va ri-derivata** contro il riferimento float32. Motivo:
-un peso fuso in BF16 arrotonda `W + s·B@A` *prima* di applicarlo, e porta quindi
-un errore proprio che il riferimento float32 non ha. La soglia nuova si misura,
-non si eredita.
+**Tolleranza: L2 relativo `<= 3e-3`, misurato a `strength 100`.** Un numero
+solo, non uno per forma: le quattro proiezioni stanno entro l'1,8% l'una
+dall'altra, splittarle non comprerebbe niente.
+
+`1e-3` **non sopravvive**. Era scritto contro un oracolo a peso fuso in BF16, che
+arrotonda `W + s·B@A` *prima* di applicarlo e porta quindi un errore proprio.
+Contro il riferimento float32 il pavimento di errore misurato è **1,65e-03 a
+1,68e-03**, già sopra la vecchia soglia: ereditarla farebbe fallire
+un'implementazione corretta.
+
+Perché `strength 100` e non 1: l'errore del ramo **non dipende dalla strength**
+(piatto su 1,65e-03..1,68e-03 da `s = 1` a `s = 100`), mentre il peso del delta
+cresce **linearmente** con essa. A `s = 1` il delta vale 1,7e-04 a 5,0e-04, cioè
+*sotto* il pavimento di rumore, e un T1 a strength 1 passerebbe con il delta
+cancellato. A `s = 100` il delta minimo misurato è **1,61e-02**, 5,4 volte la
+soglia, quindi un delta assente, trasposto o mal scalato la sfonda. La strength
+alta è un amplificatore di segnale per il test, non un valore d'uso.
+
+La soglia si applica alla cifra **`bf16-out`**, la somma riarrotondata a BF16,
+sempre la maggiore delle due stampate: così il numero regge qualunque esito abbia
+la decisione aperta sul dtype di accumulazione. Peggiore misurato 2,374e-03,
+margine 26%.
+
+**Guardia sulla significatività**: T1 deve fallire anche quando il peso del delta
+scende sotto `10x` la tolleranza. Senza, sostituire un file LoRA troppo debole
+degrada il test in un no-op silenzioso.
+
+Misurato con `h3_lora_oracle_test loras/turbo.safetensors MiniMax-H3 100 <block>`
+sui blocchi 0, 10, 25, 44. `rel-max` resta non vincolato, peggiore misurato
+5,49e-03. **Non misurato a rank 16**: il file locale è la turbo potata e tutte le
+coppie sopravvissute sono a rank 64.
 
 **T2 — Identità a strength zero.** `h3` con `--lora X --lora-strength 0` produce
 un mp4 **byte-identico** a `h3` senza `--lora`, stesso seed e stessi parametri.
