@@ -10,7 +10,9 @@
 | Codice `h3.c` allo stato del commit `8974cc0` | punti di innesto, vincoli di percorso, infrastruttura di test |
 | `README.md` del repo | comportamento documentato di `--ssd-streaming` e dello schedule |
 | `minimax_h3_turbo_v4_step600_pruned_comfyui.safetensors` | schema del file LoRA, verbatim in sezione 7 |
+| Header del turbo LoRA upstream non pruned (letto in sessione) | prefisso opzionale, ranghi non uniformi, coppie AdaLN presenti |
 | `gh api` su `ggml-org/llama.cpp` e `leejet/stable-diffusion.cpp` (2026-09-02) | scelta della BAR |
+| Lettura integrale di `llama-adapter.cpp` / `llama-graph.cpp` / `llama-context.cpp` (`docs/research/llama-cpp-adapters.md`, branch `research/llama-cpp-adapters`) | politica di fallimento, rango per coppia, aggiunte al piano di test |
 
 **Destinazione di questo documento**: il lavoro di pianificazione in corso produce
 un **design chiuso** — ogni punto aperto reso non ambiguo. L'implementazione è una
@@ -46,7 +48,19 @@ dell'utente che lo invoca. Gli attori sono due, e usano la stessa libreria:
 2. `h3` legge l'header safetensors di ogni file, **riconosce la convenzione di
    naming**, e normalizza le coppie in una rappresentazione interna unica.
 3. Per ogni coppia, `h3` verifica che il tensore bersaglio esista nel checkpoint
-   e che le forme siano compatibili; una incompatibilità è un errore, non un avviso.
+   e che le forme siano compatibili. **Una coppia il cui nome non ha un bersaglio,
+   o la cui forma non entra in un bersaglio supportato, viene segnalata e
+   saltata**: il caricamento prosegue. Sono fatali due soli casi: un file
+   illeggibile o non parsabile, e una coppia internamente incoerente, cioè con il
+   rango di `A` e quello di `B` discordi.
+
+   Questa regola **sostituisce** la formulazione precedente di questo punto
+   ("una incompatibilità è un errore, non un avviso"), che era la politica della
+   BAR: `llama.cpp` aborta sulla prima coppia orfana (`llama-adapter.cpp:331`).
+   La divergenza è deliberata. Un LoRA reale contiene coppie destinate a varianti
+   del modello che `h3` non carica, e abortire renderebbe inutilizzabile un file
+   per il resto valido. Il prezzo di questa scelta è la regola **H5**, che rende
+   ogni salto visibile.
 4. Gli adapter restano residenti in memoria come tensori separati. **I pesi base
    non vengono mai modificati**, né su disco né nei buffer GPU.
 5. A ogni valutazione del denoiser, per ogni proiezione bersaglio, la GPU calcola
@@ -87,6 +101,10 @@ Un turbo LoRA a cui manca metà degli adapter deve *dirlo*, non degradare in
 silenzio — è esattamente il modo in cui il file di prova di questa sessione
 sarebbe passato inosservato.
 
+Il **salto** è consentito (sezione 3, punto 3), il **silenzio** no. Anche qui la
+BAR è dietro: `llama.cpp` salta senza dire niente le coppie `_norm.weight`, sotto
+un TODO (`llama-adapter.cpp:287-290`). H5 vieta esattamente questo.
+
 **H6 — La scala dichiarata dal file vince.** Nelle convenzioni che portano
 `alpha`, il fattore effettivo è `alpha/rank` e va letto dal file, non assunto.
 La `strength` dell'utente moltiplica quel fattore, non lo sostituisce.
@@ -98,8 +116,16 @@ La `strength` dell'utente moltiplica quel fattore, non lo sostituisce.
 Non c'è dashboard né export. Gli output secondari richiesti sono tre, tutti
 testuali:
 
-1. **All'attivazione di un LoRA**: percorso, rango, numero di coppie applicate,
-   numero di coppie non applicabili con il motivo (regola H5), memoria occupata.
+1. **All'attivazione di un LoRA**: percorso, **distribuzione dei ranghi** (non un
+   rango unico, vedi 7.2), numero di coppie applicate, numero di coppie saltate
+   con il motivo (regola H5), **numero di coppie AdaLN**, memoria occupata.
+
+   Il conteggio delle coppie AdaLN va dichiarato **sempre**, anche quando è zero.
+   Zero coppie AdaLN è normale in un LoRA di stile e patologico in un LoRA turbo,
+   e solo l'utente sa quale dei due sta caricando. In più, se l'header del file
+   porta una firma di conversione (`partial_conversion`, `removed_pair_count`,
+   `adaln_keys_removed`), va emesso un avviso esplicito che la cita: quel file è
+   stato potato da un convertitore e il numero di coppie mancanti è scritto lì.
 2. **`!status`** deve elencare i LoRA attivi con la rispettiva strength.
 3. **`--profile`** — requisito **ritirato**. L'API di profiling del repo è
    due funzioni (`h3_gpu.h:98-99`), `h3_gpu_profile_set_label` e
@@ -209,8 +235,20 @@ diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight   BF16  [21504, 64]
 diffusion_model.token_refiner.blocks.0.mlp.fc1.lora_A.weight   BF16 [64, 5376]
 ```
 
-Nome del bersaglio = chiave meno il prefisso `diffusion_model.` e meno il
-suffisso `.lora_{A,B}.weight`, più `.weight`.
+Nome del bersaglio = chiave meno il suffisso `.lora_{A,B}.weight`, più
+`.weight`, e meno il prefisso `diffusion_model.` **se presente**.
+
+**Il prefisso `diffusion_model.` è opzionale.** Il file di prova, convertito per
+ComfyUI, lo porta; il turbo LoRA upstream non pruned **non lo porta**. Un loader
+che lo rimuove senza verificare che ci sia non trova **nessuna** coppia su
+quest'ultimo. Vanno accettate entrambe le forme.
+
+**Il rango non è uniforme dentro un file.** Nel turbo upstream le coppie AdaLN
+sono a rango 16 e tutte le altre a rango 64. Non esiste quindi un "rango del
+file": il rango si legge **per coppia**, dalla forma di `A` (`[rank, in]`) e di
+`B` (`[out, rank]`), e i due valori devono concordare. Se discordano, la coppia è
+internamente incoerente e il caso è fatale (sezione 3, punto 3). La BAR fa la
+stessa cosa, leggendo il rango per coppia da `b->ne[0]` (`llama-adapter.cpp`).
 
 Metadati del file di prova, verbatim:
 
@@ -227,8 +265,23 @@ Metadati del file di prova, verbatim:
 
 Quel `warning` è il motivo per cui la regola **H5** esiste.
 
-Convenzione B, da supportare per rilevamento automatico (decisione di Fase 3):
-`lora_up` / `lora_down` con `alpha`, dove il fattore è `alpha/rank` (regola H6).
+### 7.3 Convenzioni: cosa si supporta e cosa si rifiuta
+
+**Supportata**: la convenzione A qui sopra, `lora_A` / `lora_B`, **più la
+variante ibrida** in cui le stesse coppie sono accompagnate da un tensore
+`.alpha`. In quel caso il fattore di scala è `alpha/rank` letto dal file
+(regola H6), con il rango **della coppia**, non del file.
+
+**Rilevata e rifiutata**: la convenzione B, `lora_up` / `lora_down` con i nomi
+appiattiti a underscore, viene **riconosciuta e respinta con un errore chiaro**.
+Non è supportata. Motivo: nessun file nel corpus del proprietario la usa, e
+supportarla vorrebbe dire scrivere e mantenere un de-appiattimento dei nomi senza
+un solo caso di prova su cui validarlo. L'errore deve nominare la convenzione
+rilevata, così che l'utente sappia che il file non è corrotto ma solo nel formato
+sbagliato.
+
+Questa decisione **sostituisce** quella di Fase 3 ("convenzione B da supportare
+per rilevamento automatico").
 
 ---
 
@@ -280,6 +333,13 @@ per-step in streaming. Usa lo **stesso** meccanismo di invalidazione di 7bis.2.
 Limite noto: non è testabile con il LoRA di riferimento di questa sessione, le
 cui 51 coppie AdaLN sono state rimosse dal suo convertitore (sezione 7.2).
 
+Quella rimozione, però, non riguarda `h3`. Il convertitore ha potato le coppie
+perché puntavano a una variante **pruned** di FL2VA il cui ingresso AdaLN è a 8
+dimensioni, mentre la sorgente era a 2688. `h3` carica la FL2VA **non pruned**,
+dove quelle coppie entrano esattamente. Sono quindi recuperabili scaricando il
+turbo LoRA upstream (circa 780 MB), che le porta a rango 16. Verificato a livello
+di byte sugli header dei due file.
+
 ---
 
 ## 8. Requisiti di test
@@ -306,13 +366,30 @@ non si eredita.
 un mp4 **byte-identico** a `h3` senza `--lora`, stesso seed e stessi parametri.
 Copre H4.
 
-**T3 — Parser, entrambe le convenzioni.** File sintetici minuscoli in stile A e
-stile B, con `alpha != rank`, verificando che la scala effettiva sia `alpha/rank`.
-Copre H6.
+**T1b — Oracolo di blocco intero.** Lo stesso confronto di T1, ma su **tutte e
+quattro** le proiezioni di un blocco reale nello stesso passaggio. Motivo: un
+oracolo per singolo tensore passa anche se una proiezione è trasposta rispetto a
+un'altra, o se a una manca del tutto l'innesto. Solo il blocco intero lo vede.
 
-**T4 — Rifiuto e segnalazione.** Un LoRA con una coppia dalla forma sbagliata
-deve fallire con errore. Un LoRA con coppie verso tensori non applicati deve
-elencarle. Copre H5.
+**T3 — Parser.** File sintetici minuscoli in convenzione A, nella variante ibrida
+con `.alpha` e `alpha != rank` verificando che la scala effettiva sia `alpha/rank`
+(copre H6), con e senza il prefisso `diffusion_model.`, e con ranghi diversi
+dentro lo stesso file. Un file in convenzione B deve essere respinto con l'errore
+di 7.3. Un file il cui `base_model` nei metadati non corrisponde al checkpoint
+caricato deve produrre un **avviso**, non un errore: il campo è informativo e
+scritto dal convertitore.
+
+**T3b — Parsing della riga di comando.** `--lora PATH[:STRENGTH]`: percorso nudo
+(strength `1.0`), percorso con strength, ripetizione del flag, e **un percorso
+che contiene esso stesso un `:`**. Lo split sull'ultimo `:` è la regola sottile
+di G3 e va coperta da un test, non dalla lettura del codice.
+
+**T4 — Rifiuto e segnalazione.** Tre casi distinti, con esiti distinti:
+un LoRA con coppie verso tensori che `h3` non applica deve **elencarle e
+proseguire** (H5 e sezione 3 punto 3); una coppia internamente incoerente, con i
+ranghi di `A` e `B` discordi, deve **fallire**; un file **troncato**, cioè con un
+header valido e i dati incompleti, deve fallire con un errore che dice che è
+troncato, non con un crash.
 
 **T5 — Composizione.** Due LoRA attivi insieme danno lo stesso risultato di un
 singolo LoRA i cui delta sono la somma dei due, entro la tolleranza di T1.
@@ -373,8 +450,9 @@ stato misurato**. Il tetto si fissa dopo quella misura, non prima.
 
 - **Scope, le quattro decisioni, il caso d'uso** — sessione con NeoKree del
   2026-09-01/02. Decisioni di Fase 3: solo `--ssd-streaming`; più LoRA con
-  hot-swap in sessione; rilevamento automatico del formato; prestazioni non
-  vincolanti in questo giro.
+  hot-swap in sessione; rilevamento automatico del formato (**superata**, vedi
+  7.3: la convenzione B è rilevata e rifiutata); prestazioni non vincolanti in
+  questo giro.
 - **Punti di innesto e vincoli di percorso** — lettura diretta di `h3_dit.c`
   (righe 502, 517-522, 615-618, 804-880, 819-821, 869, 1556, 1633-1639, 1667,
   1670), `h3_dit_schedule.c` (267), `h3_gpu.m` (364-373, 3780, 3805-3810),
