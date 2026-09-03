@@ -10,7 +10,8 @@
 | Codice `h3.c` allo stato del commit `8974cc0` | punti di innesto, vincoli di percorso, infrastruttura di test |
 | `README.md` del repo | comportamento documentato di `--ssd-streaming` e dello schedule |
 | `minimax_h3_turbo_v4_step600_pruned_comfyui.safetensors` | schema del file LoRA, verbatim in sezione 7 |
-| Header del turbo LoRA upstream non pruned (letto in sessione) | prefisso opzionale, ranghi non uniformi, coppie AdaLN presenti |
+| Header di `larryvrh/MiniMax-H3-Turbo-Lora` / `minimax_h3_turbo_4step.safetensors` (779,8 MB, letto con range request da 1 MB) | prefisso opzionale, ranghi non uniformi, chiavi AdaLN verbatim, il bersaglio `final_layer` |
+| `H3_Combat_V2.safetensors` (147,9 MB, ai-toolkit) | secondo LoRA reale a rango 16, corpus di test in sezione 8bis |
 | Lettura di `llama-adapter.cpp` / `llama-graph.cpp` / `llama-context.cpp` come arte nota (`docs/research/llama-cpp-adapters.md`, branch `research/llama-cpp-adapters`) | politica di fallimento, rango per coppia, aggiunte al piano di test |
 
 **Destinazione di questo documento**: il lavoro di pianificazione in corso produce
@@ -193,6 +194,12 @@ testuali:
    (`16-64` nasconde la bimodalità, che è il segnale utile: 16 è l'AdaLN, 64 il
    backbone) e non un raggruppamento per tipo di bersaglio, che inventerebbe una
    tassonomia da mantenere a ogni bersaglio nuovo.
+
+   Il conteggio delle coppie AdaLN comprende `final_layer.adaln_proj.linear`
+   insieme ai 50 `blocks.N.adaln_proj.linear`, quindi su un turbo upstream
+   completo vale **51 e non 50**. È lo stesso numero che un file potato cita in
+   `removed_pair_count=51`: contarne 50 metterebbe due cifre diverse per la
+   stessa cosa a due righe di distanza.
 
    Il conteggio delle coppie AdaLN va dichiarato **sempre**, anche quando è zero.
    Zero coppie AdaLN è normale in un LoRA di stile e patologico in un LoRA turbo,
@@ -506,7 +513,26 @@ Forme reali, lette dagli header dei shard FL2VA:
 | `blocks.N.mlp.fc1.weight` | `[28672, 5376]` |
 | `blocks.N.mlp.fc2.weight` | `[5376, 14336]` |
 
-Copertura: **208 tensori su 535, pari al 60,5% del DiT in byte** (37,3 GiB su 61,7).
+Copertura delle sole quattro proiezioni: **208 tensori su 535, pari al 60,5%
+del DiT in byte** (37,3 GiB su 61,7).
+
+**Ci sono anche due bersagli AdaLN.** Non sono proiezioni per-step ma precalcoli
+una tantum (vedi 7bis.3), e questa sezione non li enumerava perché è stata
+scritta leggendo il file di prova potato, che non ne porta nessuno:
+
+| Tensore | Forma | Caricato in |
+|---|---|---|
+| `blocks.N.adaln_proj.linear.weight` | `[96768, 2688]` | `h3_dit_schedule.c:267` |
+| `final_layer.adaln_proj.linear.weight` | `[10752, 2688]` | `h3_dit_schedule.c:304` |
+
+`final_layer` è **una** coppia sola, non una per blocco: è il layer di uscita, e
+le 51 coppie AdaLN del turbo upstream sono 50 blocchi più questa. Il bersaglio si
+risolve per nome contro il checkpoint, che è come il loader scopre già la forma,
+quindi non serve un ramo in più nel controllo: serve un nome in più
+nell'enumerazione.
+
+Copertura con gli AdaLN: **259 tensori su 535, pari al 99,8% del DiT in byte**
+(61,60 GiB su 61,73). Misurato sommando gli header dei 13 shard FL2VA.
 
 ### 7.2 Schema del file LoRA
 
@@ -611,20 +637,45 @@ avanzamento "precompute AdaLN" a `h3_dit.c:1556`). La modulazione è precalcolat
 una volta per tutti gli step e cachata; il denoiser si limita a leggere
 `h3_dit_schedule_block()`.
 
+C'è un secondo tensore con lo stesso ruolo e un solo esemplare,
+`final_layer.adaln_proj.linear.weight` `[10752, 2688]`, caricato sette righe più
+sotto a `h3_dit_schedule.c:304`. È enumerato in 7.1 insieme all'altro.
+
 `adaln_proj` **non** è quindi una quinta proiezione per blocco accanto alle
 quattro della sezione 7.1: strutturalmente è lo stesso problema del refiner, un
 precalcolo una tantum invalidato da un cambio di LoRA, **non** una proiezione
 per-step in streaming. Usa lo **stesso** meccanismo di invalidazione di 7bis.2, specificato in 7bis.5.
 
-Limite noto: non è testabile con il LoRA di riferimento di questa sessione, le
-cui 51 coppie AdaLN sono state rimosse dal suo convertitore (sezione 7.2).
+**Le chiavi AdaLN sono lette, non dedotte.** L'header del turbo upstream non
+potato (`larryvrh/MiniMax-H3-Turbo-Lora`, `minimax_h3_turbo_4step.safetensors`,
+779,8 MB) è stato riletto con una range request da 1 MB: 57.480 byte di header,
+518 chiavi, 259 coppie, ranghi `{64: 208, 16: 51}`, nessun `.alpha`, nessun
+prefisso. Verbatim:
 
-Quella rimozione, però, non riguarda `h3`. Il convertitore ha potato le coppie
-perché puntavano a una variante **pruned** di FL2VA il cui ingresso AdaLN è a 8
-dimensioni, mentre la sorgente era a 2688. `h3` carica la FL2VA **non pruned**,
-dove quelle coppie entrano esattamente. Sono quindi recuperabili scaricando il
-turbo LoRA upstream (circa 780 MB), che le porta a rango 16. Verificato a livello
-di byte sugli header dei due file.
+```
+blocks.N.adaln_proj.linear.lora_A.weight     BF16  [16, 2688]
+blocks.N.adaln_proj.linear.lora_B.weight     BF16  [96768, 16]
+final_layer.adaln_proj.linear.lora_A.weight  BF16  [16, 2688]
+final_layer.adaln_proj.linear.lora_B.weight  BF16  [10752, 16]
+```
+
+Coincidono con quello che la regola di 7.2 deriva dal nome del bersaglio, quindi
+la regola regge; ma `final_layer` non era enumerato, e con il fallimento fatale
+della sezione 3 quel file sarebbe stato **interamente inutilizzabile** per 51
+coppie su 259. È il prezzo che la sezione 3 mette a verbale, presentato dal primo
+file reale che lo tocca.
+
+Copertura dei bersagli nell'upstream, per il verbale: 200 coppie sulle quattro
+proiezioni dei blocchi, 50 su `blocks.N.adaln_proj.linear`, 8 sulle quattro
+proiezioni dei due blocchi del token refiner, 1 su `final_layer.adaln_proj.linear`.
+
+Il LoRA di riferimento di questa sessione resta senza coppie AdaLN: il suo
+convertitore le ha rimosse (sezione 7.2) perché puntavano a una variante
+**pruned** di FL2VA il cui ingresso AdaLN è a 8 dimensioni, mentre la sorgente
+era a 2688. `h3` carica la FL2VA **non pruned**, dove entrano esattamente. Ma
+scaricare gli 780 MB **non serve**: vedi il corpus di test in sezione 8, dove il
+caso AdaLN numerico si misura con una coppia sintetica alle forme reali contro
+una `W` vera.
 
 ---
 
@@ -782,6 +833,85 @@ Il repo ha già una suite estesa (`make test`, oltre venti binari fra cui
 `h3_real_dit_block_test`, `h3_semantic_dit_test`, `h3_bf16_tests`). I test nuovi
 si aggiungono lì, con lo stesso stile, non in un framework nuovo.
 
+### 8bis. Il corpus
+
+I test si dividono in due metà secondo il **soggetto**. Quando il soggetto è il
+*contenuto* del file (nomi, forme, metadati, header rotto) il file si sintetizza.
+Quando il soggetto sono i *numeri* (accordo con il riferimento float32, identità
+byte a byte del video) servono checkpoint e LoRA reali. La linea non lascia zone
+grigie: nessun test guarda un numero prodotto da un file inventato, e nessun test
+aspetta un download per controllare una stringa.
+
+**Metà sintetica: T3, T3b, T4, T4b.** Undici file, scritti dal binario di test in
+una directory temporanea a ogni esecuzione e cancellati all'uscita. Nessun file
+committato, nessuna voce nuova in `.gitignore`, nessun checksum, nessun percorso
+da documentare. Safetensors è un `uint64` di lunghezza, un header JSON e byte
+grezzi: generarlo in C è coerente con il "niente Python nel loop di test" che T1
+già impone, e il generatore deve esistere comunque perché le fixture siano
+verificabili, quindi committarne anche l'output sarebbe la stessa cosa scritta
+due volte.
+
+| # | Fixture | Preteso da |
+|---:|---|---|
+| 1 | convenzione A minima, con prefisso `diffusion_model.` | T3 |
+| 2 | la stessa, senza prefisso | T3 |
+| 3 | ibrida con `.alpha` e `alpha != rank` | T3, H6 |
+| 4 | ranghi diversi dentro lo stesso file | T3 |
+| 5 | convenzione B (`lora_up`/`lora_down`), da respingere | T3, 7.3 |
+| 6 | `base_model` nei metadati non corrispondente, da avvisare | T3 |
+| 7 | due o più coppie orfane | T4, H5 |
+| 8 | coppia incoerente, rango di `A` diverso da quello di `B` | T4 |
+| 9 | file troncato: header valido, dati incompleti | T4 |
+| 10 | firma di conversione nei metadati | T4b |
+| 11 | coppie con nome AdaLN | T4b |
+
+T3b non aggiunge un dodicesimo file: è la fixture 1 scritta su un percorso che
+contiene un `:`.
+
+Poiché queste fixture non possono mancare, i test che le usano **non saltano
+mai**. È questo che disinnesca la preoccupazione di 5.1: il conteggio AdaLN
+sempre dichiarato e l'avviso di conversione sono verificati anche su una macchina
+senza checkpoint, cioè proprio dove uno skip li avrebbe nascosti.
+
+**Metà reale: T1, T1b, T2, T5, T6.** Due file, entrambi già presenti, nessun
+download:
+
+| File | Coppie | Rango | AdaLN | Copre |
+|---|---:|---:|---|---|
+| `minimax_h3_turbo_v4_step600_pruned_comfyui.safetensors` (591,6 MB) | 208 | 64 | no | T1, T1b, T2, T6 |
+| `H3_Combat_V2.safetensors` (147,9 MB) | 208 | 16 | no | T1 a rango 16, T5 |
+
+Il secondo chiude il "non misurato a rango 16" di T1 e dà a T5 due LoRA reali di
+rango diverso invece dello stesso file usato due volte. È convenzione A, prefisso
+`diffusion_model.`, nessun `.alpha`, metadati `ai-toolkit` con
+`ss_base_model_version: minimax_h3`.
+
+Il caso AdaLN numerico **non richiede il turbo upstream**: l'oracolo costruisce
+`W + s·B@A` da una `W` reale e da una coppia qualunque della forma giusta, quindi
+una coppia sintetica `A[16, 2688]` / `B[96768, 16]` (circa 3,2 MB) si misura
+contro `blocks.N.adaln_proj.linear.weight` esattamente come le altre quattro
+proiezioni. I nomi delle chiavi non sono dedotti: sono letti dall'header
+upstream, vedi 7bis.3.
+
+**Nessun LoRA entra nel repo.** GitHub rifiuta il push di qualunque file oltre i
+100 MB e i due reali sono 591,6 e 147,9: passerebbero solo con Git LFS, che è una
+dipendenza esterna in un progetto che non ne ha, che `antirez/h3.c` non usa, e
+che farebbe pagare 740 MB a ogni clone per sempre, il doppio il giorno che un
+file viene sostituito. Sono anche ridistribuzioni di terzi a licenza non
+verificata.
+
+**Assenza di un file reale: `skip:`, come il resto della suite.** `make test`
+guarda ogni file con `test -f` e stampa `skip:` in tredici punti; la metà reale
+segue quella convenzione e non ne inventa una seconda. I binari che pretendono i
+62 GB stanno in un **target separato senza guardie**, sul modello di `make
+parity` e `make real-parity`, che già falliscono duro quando i loro file non ci
+sono. La divisione cade dove deve: `make test` resta verde su una macchina nuda,
+quindi T7 resta verificabile senza checkpoint, e il target dedicato dichiara di
+volerlo.
+
+Il README guadagna una sezione di setup che elenca quali file installare e dove,
+così il target dedicato ha una procedura invece di un messaggio d'errore.
+
 **T1 — Equivalenza al peso fuso (l'oracolo).** L'oracolo è un **riferimento CPU
 in float32 costruito dentro il binario di test in C**, non un artefatto generato
 fuori: si prende un `W` reale dal checkpoint e una coppia `(A, B)` reale dal file
@@ -898,7 +1028,7 @@ l'insieme**, non solo il pezzo toccato.
 
 | # | Gap | Stato |
 |---|---|---|
-| G1 | `adaln_proj`: **supportato**. Non è una quinta proiezione per blocco ma un precalcolo una tantum (sezione 7bis.3), invalidato da un cambio di LoRA con lo stesso meccanismo del refiner. Non verificabile con il LoRA di riferimento, che ha le 51 coppie AdaLN rimosse. | **chiuso, supportato** |
+| G1 | `adaln_proj`: **supportato**, e sono **due** bersagli, non uno: `blocks.N.adaln_proj.linear.weight` più `final_layer.adaln_proj.linear.weight` (sezione 7.1), che è la coppia numero 51. Non è una quinta proiezione per blocco ma un precalcolo una tantum (sezione 7bis.3), invalidato da un cambio di LoRA con lo stesso meccanismo del refiner. Il LoRA di riferimento ha le 51 coppie rimosse, ma il caso **è** verificabile: coppia sintetica alle forme reali contro una `W` vera, con le chiavi lette dall'header upstream (sezione 8bis). | **chiuso, supportato** |
 | G2 | `--lora` funziona **sia** in one-shot (`h3 -p ...`) **sia** in sessione interattiva. Motivo: T2 confronta due invocazioni di `h3` a parità di seed, che *è* modalità one-shot — il piano di test la richiedeva già. | **chiuso** |
 | G3 | Sintassi fissata: **`--lora PATH[:STRENGTH]`**, ripetibile, strength opzionale con default `1.0`, parsata **splittando sull'ultimo `:`**. Superficie interattiva: `!lora add PATH [STRENGTH]`, `!lora set PATH STRENGTH`, `!lora remove PATH`, `!lora` nudo elenca. Motivo: LoRA e strength non sono separabili da un errore dell'utente, a differenza di flag appaiati dove una strength omessa sposta tutti gli argomenti successivi. | **chiuso** |
 | G4 | Tetto di memoria. **Chiuso**: nessun tetto statico sugli adapter. Il tetto è sul **processo intero**, misurato e mai previsto, e al tetto h3 **si ferma**. Vale `min(recommendedMaxWorkingSetSize - 4 GiB, libera di sistema + footprint attuale)`, verificato a due cancelli, ed è **sempre attivo** anche senza LoRA: allargamento dichiarato da "tetto degli adapter" a "guardrail di memoria di h3". Dettaglio sotto. | **chiuso** |

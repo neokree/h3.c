@@ -80,6 +80,21 @@ measured against (`tests/test_lora_oracle.c`). Numerical agreement is measured,
 never asserted.
 _Avoid_: golden file, ground truth
 
+**Fixture**:
+A LoRA file the test binary writes for itself, into a temporary directory,
+deleted when the test exits. Its subject is a file's **content**: names, shapes,
+metadata, a broken header. Because it cannot be absent, a test that uses one
+never skips, which is what puts the [[load-report]] checks on a machine with no
+checkpoint.
+_Avoid_: test file, sample, golden file
+
+**Corpus file**:
+A real LoRA or the real checkpoint, installed on the machine and never in the
+repo. Its subject is the **numbers**: agreement with the oracle, byte identity of
+a video. Absence prints `skip:` in `make test`, the way the other thirteen
+real-weight tests already do.
+_Avoid_: fixture (a fixture is synthesised; a corpus file is downloaded), asset
+
 ## Background terms
 
 These are not ours; they are the vocabulary the definitions above assume.
