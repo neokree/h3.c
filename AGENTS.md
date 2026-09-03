@@ -4,7 +4,7 @@ Nota operativa per un agente che arriva qui a freddo. Il `README.md` documenta
 la CLI per intero: questo file copre solo lo **stato di questa macchina** e i
 **numeri misurati**, che nel README non ci sono.
 
-La specifica della feature in corso (LoRA a runtime) sta in **`docs/WHAT.md`**.
+La specifica della feature in corso (LoRA a runtime) sta in **`docs/SPEC.md`**.
 
 ## Stato dell'installazione
 

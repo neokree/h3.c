@@ -1,4 +1,4 @@
-/* T1 oracle harness for runtime LoRA adapters (docs/WHAT.md section 8).
+/* T1 oracle harness for runtime LoRA adapters (docs/SPEC.md section 8).
  *
  * The claim under test is H3: the runtime branch
  *
@@ -136,7 +136,7 @@ static float *expand_bf16(const uint16_t *values, size_t count,
 }
 
 /* Look the pair up with and without the diffusion_model. prefix: the ComfyUI
- * conversion carries it, the upstream file does not (docs/WHAT.md 7.2). */
+ * conversion carries it, the upstream file does not (docs/SPEC.md 7.2). */
 static const h3_st_tensor *find_pair(const h3_st_header *lora, int block,
                                      const char *projection, const char *half) {
     char name[256];

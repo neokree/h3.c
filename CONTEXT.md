@@ -2,7 +2,7 @@
 
 This context covers loading LoRA adapters at run time on the `--ssd-streaming`
 path, without baking anything into the 62 GB base checkpoint. The design map is
-issue [#1](https://github.com/neokree/h3.c/issues/1); the spec is `docs/WHAT.md`.
+issue [#1](https://github.com/neokree/h3.c/issues/1); the spec is `docs/SPEC.md`.
 
 The glossary is written for a reader who is not a machine-learning engineer.
 Terms in the first section are ours and are used with exactly this meaning;

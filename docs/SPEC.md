@@ -1,4 +1,4 @@
-# WHAT.md — LoRA dinamici in h3-metal
+# SPEC.md — LoRA dinamici in h3-metal
 
 ## 0. Header
 
@@ -594,6 +594,34 @@ sbagliato.
 
 Questa decisione **sostituisce** quella di Fase 3 ("convenzione B da supportare
 per rilevamento automatico").
+
+**Rilevata e rifiutata**: gli **adapter di bias**, tensori `.diff_b`. Sono una
+terza categoria, né una coppia low-rank né un bersaglio mancante: un *tipo* di
+adapter che h3 non implementa. Un `.diff_b` è un delta a rango pieno sul bias,
+`[96768]` F32, uno per blocco, che si sommerebbe a
+`blocks.N.adaln_proj.linear.bias` (bersaglio che nel checkpoint **esiste**, con
+esattamente quella forma). Verificato nell'header di
+`barelymining/ComfyUI-MiniMax-H3-FastVideo/fasth3_vsa_4-steps-v5.safetensors`:
+615 tensori, 150 chiavi AdaLN = 50 blocchi x (`lora_A`, `lora_B`, `diff_b`).
+
+Il messaggio deve dire che gli adapter di bias non sono supportati, **non**
+"suffisso inatteso": il file non è malformato, contiene una cosa che sappiamo
+riconoscere e abbiamo scelto di non applicare.
+
+Motivo del rifiuto invece del supporto: implementarlo non sbloccherebbe **nessun
+file reale conosciuto**. Quello stesso file cade comunque prima, sul controllo di
+forma AdaLN (`lora_A [64, 8]` da `B@A = [96768, 8]` contro `[96768, 2688]`), che
+è il percorso fatale della §3.3. Il bias delta è il secondo ostacolo, non il
+primo. Il costo sarebbe modesto e non violerebbe H1 (il bias è già un tensore a
+parte passato a `h3_gpu_linear_bf16` in `h3_dit_schedule.c:290` e liberato a
+`:294`, quindi `bias + s*diff_b` starebbe in uno scratch ricostruito a ogni load,
+mai in un buffer streamato) ma comprerebbe zero file utilizzabili in più.
+
+Precedente: `llama.cpp` lancia su suffisso inatteso
+(`src/llama-adapter.cpp:291`). Qui si fa lo stesso, nominando la categoria.
+
+Se comparirà un file il cui **unico** ostacolo è il `.diff_b`, l'errore lo dirà
+per nome e la decisione si riapre allora, con un caso di prova in mano.
 
 ---
 
