@@ -49,8 +49,8 @@ dell'utente che lo invoca. Gli attori sono due, e usano la stessa libreria:
 3. Per ogni coppia, `h3` verifica che il tensore bersaglio esista nel checkpoint
    e che le forme siano compatibili. **Una coppia il cui nome non ha un bersaglio,
    o la cui forma non entra in un bersaglio supportato, è fatale**: il caricamento
-   si ferma, il messaggio d'errore le elenca **tutte**, e nessuna generazione
-   parte. Sono fatali anche un file illeggibile o non parsabile e una coppia
+   si ferma, il messaggio d'errore le elenca **tutte** (stringhe alla sezione
+   5bis.2), e nessuna generazione parte. Sono fatali anche un file illeggibile o non parsabile e una coppia
    internamente incoerente, cioè con il rango di `A` e quello di `B` discordi.
 
    Questo punto è stato rivisto due volte. La formulazione originale ("una
@@ -227,6 +227,149 @@ testuali:
 
 ---
 
+## 5bis. Messaggi d'errore
+
+Le stringhe dei casi fatali e dello stop del guardrail sono contratto come lo è
+il report: H5 esige che l'utente veda cosa è mancato, e a tredici minuti per run
+un messaggio vago costa un run.
+
+### 5bis.1 Il canale: riepilogo su `h3_last_error`, dettaglio sul callback
+
+`h3_set_error` è una `vsnprintf` su **512 byte fissi** (`h3.c:361-366`,
+`h3_internal.h:14`). Le 208 coppie che H5 pretende elencate non ci entrano, e
+nemmeno tre con le shape. Il messaggio fatale ha quindi **due parti**:
+
+- **Una riga di riepilogo** in `h3_last_error`, autosufficiente: chi integra
+  `libh3.a` senza installare un callback deve comunque sapere cosa è mancato e
+  quanto.
+- **Le righe di dettaglio** attraverso `h3_report_callback`, una per coppia,
+  senza cap.
+
+Conseguenza sull'API: **`h3_params` guadagna `on_report`** accanto a `on_frame`
+e `on_progress` (`h3.h:126-128`). Senza, un embedder che salta
+`h3_lora_preload` riceve il fallimento di `h3_generate` (sezione 6ter punto 6)
+ma non l'elenco, e resta con il solo numero. La libreria **non stampa mai su
+`stderr` da sé**.
+
+Le righe del callback **non portano il prefisso `h3: `**: lo mette la CLI
+stampandole, su **ogni** riga e non solo sulla prima, perché è quello che fa
+sopravvivere un elenco all'interleaving con l'avanzamento scritto in `\r` sullo
+stesso `stderr`.
+
+### 5bis.2 Coppie inapplicabili
+
+Riepilogo, con il **percorso come l'utente l'ha scritto** e il conteggio
+**spaccato per tipo**:
+
+```
+loras/style.safetensors: 3 pairs cannot be applied (2 with no target, 1 with a shape mismatch)
+```
+
+Il percorso verbatim è una divergenza deliberata dal basename della sezione 5
+punto 2: nel report il file è già identificato dal contesto, in un errore la
+stringa utile è quella che l'utente deve correggere, e due `style.safetensors` in
+due cartelle sono un caso reale. Lo spacco per tipo c'è perché quella riga è
+**tutta** la diagnosi di chi non ha installato `on_report`.
+
+Dettaglio: **lista piatta**, ordine dell'header del file, tipo come tag di riga.
+
+```
+style.safetensors: 3 unapplicable pairs, load aborted
+  no target: blocks.51.attn.qkv (rank 64)
+  no target: blocks.51.mlp.fc1 (rank 64)
+  shape mismatch: blocks.0.mlp.fc1 is [64 x 4096], target is [64 x 3584]
+```
+
+Piatta e non in due sezioni: i due tipi non sono azionabili separatamente,
+entrambi dicono "questo file non è per questo modello" e il rimedio è lo stesso,
+mentre due sezioni obbligherebbero a riconciliare due conteggi contro il
+riepilogo. Il nome è quello della **coppia**, senza il suffisso
+`lora_A`/`lora_B`, perché la coppia è l'unità. Il **rank** su `no target` perché
+16 contro 64 dice subito se è una coppia AdaLN o backbone; le **due shape** su
+`shape mismatch` perché la differenza è la diagnosi.
+
+**Nessun cap, nessuna coda "and N more"**: è la ragione per cui il dettaglio va
+sul callback e non nei 512 byte. Il caso a 208 righe è il file sbagliato per il
+modello, dove l'elenco intero *è* la diagnosi; il caso realistico è 1-5, e le 208
+coppie del file di riferimento trovano tutte un bersaglio.
+
+### 5bis.3 Convenzione B rifiutata
+
+```
+turbo.safetensors: lora_up/lora_down naming is not supported
+  (first seen at blocks.0.attn.qkv.lora_up.weight); h3 reads lora_A/lora_B
+```
+
+**Un solo offendente**, citato come prova. La convenzione è una proprietà del
+**file**, non della coppia: elencare 208 `lora_up` non dice niente più di uno. La
+distinzione da tenere: *coppia inapplicabile è per-coppia, quindi tutte;
+convenzione è per-file, quindi una*. Il messaggio nomina la convenzione che `h3`
+legge perché il rimedio è convertire il file, e senza quel pezzo l'utente non sa
+verso cosa convertirlo. Non `unsupported format`, che invita una bug report
+invece di una conversione.
+
+### 5bis.4 Strength malformata
+
+I due punti di rifiuto sono fissati sotto H6: il parse della CLI e `isfinite`
+alla costruzione dell'insieme attivo.
+
+```
+h3: invalid --lora strength: 0.8x (in loras/style.safetensors:0.8x)
+lora: invalid strength: 0.8x; keeping 0.80
+lora: strength for style.safetensors is not a finite number
+```
+
+La prima segue lo stile di casa alla lettera (`main.c:71,100`, `h3: invalid %s:
+%s` più `exit(2)`) e aggiunge l'argomento intero fra parentesi, che è l'unica
+cosa che disambigua fra cinque `--lora` sulla stessa riga. La seconda è
+`!lora set`, che per convenzione tiene il valore precedente: **deve dire quale
+valore ha tenuto**, altrimenti l'utente crede di aver cambiato qualcosa. La terza
+è la rete `isfinite` sull'API pubblica, dove non c'è un frammento di testo da
+citare perché il `NaN` arriva come `float`.
+
+### 5bis.5 Lo stop del guardrail
+
+```
+h3: not enough memory for this run: 34.1 GiB needed, 32.0 GiB available
+    (Metal working set 36.0 GiB minus the 4 GiB reserve).
+    Lower the canvas or drop an adapter.
+
+h3: memory ceiling hit after the first denoiser evaluation:
+    footprint 30.2 GiB, ceiling 27.4 GiB (system free 24.9 GiB plus our 2.5 GiB).
+    Another process is holding memory: quit it, or lower the canvas.
+```
+
+Il messaggio **deve dire quale dei due termini del `min` ha morso** (sezione 10,
+G4), perché il rimedio cambia: il termine statico vuole un canvas più piccolo,
+quello dinamico vuole che l'utente chiuda il processo co-residente. Il termine si
+nomina con **la cosa fisica** (working set di Metal, memoria libera di sistema) e
+non con i nostri nomi di progetto: "statico" e "dinamico" non dicono all'utente
+cosa toccare.
+
+I gate **non si numerano** nel messaggio: `gate 1` e `gate 2` sono vocabolario
+nostro. Il messaggio dice **quando** è scattato, e `after the first denoiser
+evaluation` è già l'informazione utile perché distingue il fallimento in un
+secondo da quello dopo un'evaluation. Entrambe le stringhe stanno nei 512 byte,
+quindi escono da `h3_last_error` senza toccare il callback, che sul percorso del
+gate 2 (dentro `h3_generate`) potrebbe non esserci installato.
+
+### 5bis.6 One-shot e interattivo
+
+**Le stringhe della libreria sono identiche sulle due superfici.** Cambia la
+reazione, com'è già la convenzione di casa per ogni altra opzione: one-shot esce,
+interattivo tiene l'insieme attivo precedente. In interattivo la **CLI** aggiunge
+una riga sua:
+
+```
+h3: the active set is unchanged
+```
+
+Senza, l'utente non sa se l'`!lora add` è atterrato a metà. La stampa la CLI e
+non la libreria: è un fatto della sessione, e tenere la libreria agnostica alla
+superficie è quello che rende le stringhe identiche in primo luogo.
+
+---
+
 ## 6. Stack tecnologico e ambiente
 
 - **Linguaggio**: C (C11), come il resto del repo. Kernel in Metal Shading
@@ -282,16 +425,32 @@ opaco che il chiamante possieda: gli adapter vivono nella cache di `h3_ctx`.
    peso**. Il report esce quindi prima dei 62 GiB, e `!lora add` risponde
    nell'istante in cui lo digiti invece che alla generazione successiva.
 4. **Report su callback.**
-   `typedef int (*h3_report_callback)(const char *line, void *opaque)`, stessa
-   forma di `h3_progress_callback`. La libreria non stampa da sé: chi integra
-   `libh3.a` decide dove finisce il testo, e H5 esige che si veda.
+   `typedef void (*h3_report_callback)(const char *line, void *opaque)`, la
+   forma di `h3_progress_callback` **tranne il ritorno**. La libreria non stampa
+   da sé: chi integra `libh3.a` decide dove finisce il testo, e H5 esige che si
+   veda. Il callback vive su `h3_params` accanto a `on_frame` e `on_progress`
+   (campo `on_report`) oltre che come argomento di `h3_lora_preload`.
+
+   **Il ritorno è `void`, e la ragione va tenuta**: un `int` non-zero da
+   `h3_progress_callback` significa cancel e fa
+   `h3_set_error(ctx, "generation cancelled during %s", phase)`
+   (`h3.c:648-652`), che **sovrascrive** l'errore già impostato. Copiando quella
+   forma, un callback che ritorna non-zero a metà elenco cancellerebbe il
+   messaggio fatale e l'utente leggerebbe `cancelled` invece della diagnosi. Un
+   report non ha poi niente da annullare: le righe sono il resoconto di una
+   decisione già presa, e "annullare a metà elenco" non ha un significato. Un
+   `int` ignorato sarebbe peggio, perché il prossimo lettore lo crederebbe
+   significativo.
 5. **Chiave di cache: path più dimensione più mtime** (`stat`). Un file
    sovrascritto allo stesso path viene ricaricato invece di restare quello
    vecchio in memoria senza dirlo.
-6. **Un caso fatale ferma la generazione.** `h3_generate` fallisce e il
-   messaggio esce da `h3_last_error`. Non si consegna mai un video privo del
-   LoRA richiesto: a tredici minuti per run, non c'è modo di accorgersene
-   guardandolo. Vale solo per i due casi fatali di sezione 3 punto 3.
+6. **Un caso fatale ferma la generazione.** `h3_generate` fallisce, il
+   **riepilogo** di una riga esce da `h3_last_error` e il **dettaglio** esce
+   riga per riga da `on_report`, perché `h3_set_error` scrive in 512 byte fissi
+   e l'elenco che H5 pretende non ci sta (sezione 5bis.1). Non si consegna mai
+   un video privo del LoRA richiesto: a tredici minuti per run, non c'è modo di
+   accorgersene guardandolo. Vale solo per i due casi fatali di sezione 3
+   punto 3.
 7. **`h3_lora_release(ctx, path)`** libera una singola voce di cache, che è
    quello che serve a `!lora remove` senza svuotare anche il DiT preparato.
 8. **L'insieme attivo si sostituisce in blocco** a ogni generazione, perché vive
