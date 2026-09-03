@@ -782,9 +782,24 @@ due slot BF16 di pesi (1,5 GB, aritmetica sotto), il decoder VAE tiled
 (9,55 GiB misurati, si muove dell'1,7% per 4x i pixel) e i byte residenti degli
 adapter, noti dagli header safetensors al preload. Con `--preview` o DiT cachato
 gli ultimi due sono concorrenti, quindi ~11 GB più adapter; altrimenti gli stage
-sono serializzati (`h3.c:1591`) e il massimo è il decoder. È una **condizione
-necessaria e non sufficiente**: il picco dello stage text encoder non è misurato
-e resta fuori dal calcolo.
+sono serializzati (`h3.c:1591`) e il massimo è il decoder.
+
+Resta una **condizione necessaria e non sufficiente**, perché non modella il
+termine dipendente dal canvas del denoise: quello lo vede solo il cancello 2. Ma
+il blocco degli encoder, che prima era la lacuna dichiarata di questo calcolo,
+ora è **misurato e non lo cambia**. Il picco di processo attraverso tokenizer,
+video VAE encoder, Qwen vision e Qwen text encoder sta fra **4,7 e 6,0 GB** su
+sei run, cioè circa il 40% sotto i 9,55 GiB del decoder, che resta il massimo
+degli stage.
+
+Né il canvas né la lunghezza del prompt lo muovono in modo misurabile: la
+dispersione fra due run della **stessa** configurazione (1,1-1,3 GB) copre per
+intero l'intervallo fra le quattro configurazioni provate (`448x576` e
+`768x1344` per 1640 e 6554 caratteri di prompt). La parte deterministica è il
+contatore interno di h3 per il solo Qwen text encoder, che si ripete a quattro
+cifre fra run identici e sale appena da **2,846 a 3,204 GiB** dal caso più
+piccolo al più grande: il resto è slack dell'allocatore e del driver, non un
+termine da modellare.
 
 **Cancello 2, dopo la prima valutazione del denoiser.** Lì il footprint è a
 regime per misura (`alloc=0.000GiB` su tutto il loop di denoise). Si campiona
