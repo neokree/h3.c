@@ -120,6 +120,12 @@ inosservato.
 `alpha`, il fattore effettivo è `alpha/rank` e va letto dal file, non assunto.
 La `strength` dell'utente moltiplica quel fattore, non lo sostituisce.
 
+Uso reale della `strength`, dichiarato dal proprietario: **con segno**, in
+`[-2, 2]`, e nel 90% dei casi fra 0,6 e 0,7. La strength 100 di T1 (sezione 8) è
+quindi uno strumento di misura 50 volte fuori dall'intervallo di produzione, non
+un regime supportato. Il dominio ammesso, cioè se e dove si validano estremi e
+segno, è deciso separatamente.
+
 ---
 
 ## 5. Reportistica
@@ -400,7 +406,7 @@ una volta per tutti gli step e cachata; il denoiser si limita a leggere
 `adaln_proj` **non** è quindi una quinta proiezione per blocco accanto alle
 quattro della sezione 7.1: strutturalmente è lo stesso problema del refiner, un
 precalcolo una tantum invalidato da un cambio di LoRA, **non** una proiezione
-per-step in streaming. Usa lo **stesso** meccanismo di invalidazione di 7bis.2.
+per-step in streaming. Usa lo **stesso** meccanismo di invalidazione di 7bis.2, specificato in 7bis.5.
 
 Limite noto: non è testabile con il LoRA di riferimento di questa sessione, le
 cui 51 coppie AdaLN sono state rimosse dal suo convertitore (sezione 7.2).
@@ -502,6 +508,66 @@ superiore**. Codice del banco: `tests/bench_lora_gemm.c` su
 
 ---
 
+### 7bis.5 Il meccanismo di invalidazione
+
+**Non esiste un percorso di ricalcolo dedicato.** L'insieme attivo entra nella
+chiave della cache del DiT preparato, `h3_prepared_key` (`h3.c:164`). Chiave
+diversa dal DiT in cache e `h3.c:1502-1507` lo libera e lo ricarica: `refine_text`
+(7bis.2) e il precompute AdaLN (7bis.3) si rifanno come parte di un load normale,
+senza codice di invalidazione proprio.
+
+Costo misurato di quella ricarica: **9,011 s**, 28,5 GiB letti (`logs/run02.log`,
+30 step, 56 frame, `448x576`). Il precompute AdaLN è 24,2 di quei 28,5 GiB, cioè
+50 blocchi da `96768 x 2688` in BF16, 496 MiB ciascuno.
+
+**Alternativa rifiutata: il ricalcolo mirato.** Sarebbe più economico, perché
+AdaLN è additivo: `time·(W + s·B·A)ᵀ = time·Wᵀ + s·(time·Aᵀ)·Bᵀ`. Si potrebbe
+tenere la tabella base in memoria e sommarci il solo termine low-rank, senza
+rileggere i 24,2 GiB, al prezzo di una seconda copia della tabella, circa 600 MB
+a 30 step contro le ~2,2 GiB di margine al canvas massimo (sezione 10, G4).
+È rifiutata **per T6, non per il costo**: rimuovere un adapter significherebbe
+sottrarre un delta in floating point, e il terzo risultato non tornerebbe
+bit-identico al primo. La ricarica riesegue il percorso del primo run, quindi T6
+passa per costruzione.
+
+**La chiave del conditioning non si tocca.** `h3_conditioning_key` (`h3.c:139`)
+indicizza l'embedding del testo. Il LoRA agisce sul token refiner del DiT, non sul
+text encoder Qwen, quindi i 9,596 s dell'encoder non si ripagano a ogni cambio.
+
+**Identità di una voce dell'insieme**: una chiamata a `h3_key_file`
+(`h3.c:126-136`) più la strength. Quell'helper aggiunge già percorso, `size` e
+`mtime` in secondi e nanosecondi, ed è già usato per `--first-frame`,
+`--last-frame` e i media di riferimento: è l'identità di file che la repo ha già,
+non una nuova. `size` è ridondante come protezione dalle collisioni, con `mtime`
+al nanosecondo su APFS; si tiene perché toglierlo vorrebbe dire scrivere una
+seconda definizione divergente di "stesso file" a beneficio zero.
+
+**La chiave si costruisce dall'insieme attivo già costruito**, non dalla lista
+grezza in `h3_params`. Le voci a strength 0 sono già scartate in costruzione
+(6ter), quindi una strength portata a 0 e poi indietro non conta come due cambi
+e non serve un equivalente di `adapters_lora_are_same` di `llama.cpp`
+(`src/llama-context.cpp:1293-1317`): la guardia è nel punto in cui la chiave si
+costruisce, non in un confronto dedicato.
+
+**Sensibile all'ordine, nessun sort.** I rami sono N somme in sequenza e la somma
+in floating point non è associativa: `[A, B]` e `[B, A]` danno tabelle AdaLN
+diverse negli ultimi bit. Un riordino costa una ricarica da 9 s, è raggiungibile
+con `!lora remove` più `!lora add` ed è raro.
+
+**Pigra, non immediata.** Il confronto avviene all'inizio di `h3_generate`, non
+dentro `!lora add`, quindi un blocco di comandi `!lora` ricalcola una volta sola.
+La validazione resta immediata: `h3_lora_preload` legge solo l'header safetensors
+(6ter). Una ricarica immediata non risparmierebbe i 9 s, li anticiperebbe.
+
+**`--reuse` e `--core-reuse`: niente da fare, verificato.** `core_reuse` è già in
+`h3_prepared_key`, e il residuo cachato è `hidden - core_input`
+(`h3_dit.c:2306-2310`), formato dopo che il delta è stato sommato dentro i
+blocchi: una valutazione saltata (`h3_dit.c:2313-2315`) lo porta con sé.
+`h3_dit_reset_run` (`h3.c:1470`) non richiede logica LoRA, perché un cambio
+dell'insieme attivo è sempre un miss di cache.
+
+---
+
 ## 8. Requisiti di test
 
 Il repo ha già una suite estesa (`make test`, oltre venti binari fra cui
@@ -586,7 +652,18 @@ di `removed_pair_count` letto dall'header.
 singolo LoRA i cui delta sono la somma dei due, entro la tolleranza di T1.
 
 **T6 — Hot-swap.** In sessione: generare, aggiungere un LoRA, rigenerare con lo
-stesso seed, rimuoverlo, rigenerare. Il terzo risultato è identico al primo.
+stesso seed, rimuoverlo, rigenerare. Il terzo risultato è identico al primo
+**e il secondo è diverso dal primo**. Due asserzioni, non una: con la sola prima,
+T6 è verde anche quando il delta non viene mai applicato, perché tre run del
+modello base sono identici fra loro. Un test che verifica solo "tornando indietro
+ritrovo lo stato di prima" non distingue lo scambio funzionante dal nulla che
+accade.
+
+Il secondo run gira a una strength di produzione, **non** alla 100 di T1: su una
+traiettoria di denoise intera una perturbazione da 1e-04 nel blocco 0 diverge, e
+la disuguaglianza a livello di byte è tutto il controllo che serve, senza metrica
+di distanza. L'accettazione qualitativa sul video resta separata e a carico del
+proprietario.
 
 **T7 — Non regressione.** `make test` passa interamente, invariato.
 
