@@ -414,6 +414,94 @@ di byte sugli header dei due file.
 
 ---
 
+### 7bis.4 La forma del ramo sulla GPU
+
+Il ramo si compone di **tre dispatch**, tutti su funzioni che esistono già:
+
+```
+hidden = A·x        h3_gpu_linear_bf16
+delta  = B·hidden   h3_gpu_linear_bf16
+y      = y + delta  h3_gpu_add_bf16
+```
+
+Nessun kernel Metal nuovo. Quattro decisioni lo fissano.
+
+**La strength è fusa in `A`, non applicata a runtime.** Il fattore
+`strength * alpha/rank` viene moltiplicato dentro la copia bf16 di `A` nel
+momento in cui l'insieme attivo viene materializzato sulla GPU, **non** dentro
+l'adapter parsato in cache (sezione 6ter: quello è indicizzato per
+`path + size + mtime`). L'insieme attivo è sostituito per intero a ogni
+generazione, quindi in memoria resta **una copia per adapter**, non una per
+strength. Un cambio di strength rimaterializza `A`: se il parse è ancora in
+cache è un ricalcolo in memoria, altrimenti sono 591 MiB a 4,28 GiB/s, cioè
+**0,14 s**.
+
+Costo numerico: un arrotondamento bf16 in più sui coefficienti di `A`, ordine
+`1e-3` relativo, che vive solo dentro il delta. A `strength 100` il delta è il
+4,7% dell'output, quindi il contributo al totale è circa `1e-4`, quindici volte
+sotto il pavimento di rumore misurato di `1,65e-03` (sezione 8, T1).
+
+**L'intermedio è bf16 e vive in un solo buffer condiviso.** `hidden` è
+`righe x rank`, allocato al load e dimensionato su `max_rank` dell'insieme
+attivo, riusato da ogni proiezione di ogni blocco. Il denoise oggi ha
+`alloc=0.000GiB` sull'intero loop e deve restare così. Buffer separati per
+adapter o per proiezione non comprano parallelismo, perché i dispatch sulla
+stessa command queue sono comunque ordinati: comprano solo memoria.
+
+**N adapter sono N rami sequenziali.** Nessuna `A` concatenata, nessuna `B` a
+blocchi diagonali. È anche la scelta di `llama.cpp`
+(`llama-graph.cpp:1521-1537`). H3 vale per entrambe le forme; vince la più
+semplice, e la concatenata avrebbe uno stato derivato da ricostruire a ogni
+`!lora add`.
+
+**Il rank non viene imbottito a 256.** Motivo sotto.
+
+#### Il costo misurato, e perché non si ottimizza
+
+`h3_gpu_linear_bf16` instrada su MPS **solo** se
+`rows >= 32 && input_dim >= 256 && output_dim >= 256` (`h3_gpu.m:2517`);
+altrimenti cade sul kernel a piastrelle 16x16 scritto a mano
+(`h3_gpu.m:2537`). Con rank 16..128 **entrambe** le metà del ramo mancano la
+soglia: `A·x` ha output pari al rank, `B·hidden` ha ingresso pari al rank.
+
+Misurato su M4 Pro a **4284 righe** (la geometria vera di un run
+`448x576` / 56 frame), rank 64, mediane in ms:
+
+| proiezione | BASE `W·x` | `A·x` | `B·hidden` | ADD |
+|---|---:|---:|---:|---:|
+| qkv | 138,03 | 3,11 | 12,28 | 4,74 |
+| out | 45,85 | 4,08 | 3,21 | 1,31 |
+| fc1 | 181,79 | 3,12 | 16,33 | 6,23 |
+| fc2 | 91,48 | 8,08 | 3,20 | 1,31 |
+| **totale** | **457,14** | **18,38** | **35,01** | **13,60** |
+
+Il ramo costa il **14,7% del BASE**, circa il 7% del denoise, circa **54 s** sul
+run da 56 frame di `AGENTS.md`. Il percorso è verificato per misura e non
+assunto: `h3_gpu_stats` separa già `mps_linear_dispatches` da
+`direct_dispatches`, e ogni riga del banco stampa quale dei due si è mosso.
+
+Imbottire il rank a 256 con zeri fa entrare entrambe le metà in MPS e taglia il
+ramo al **9,8% del BASE**, circa 18 s risparmiati. È bit-esatto (differenza
+massima `0,000e+00` su tutte e quattro le proiezioni). **Resta fuori scope**
+perché costa **4x la memoria degli adapter**, da 620 MB a 2,48 GB per il file di
+riferimento, cioè **+1,86 GB residenti**: contro i circa 2,2 GiB di margine che
+G4 misura a canvas massimo con `--preview`, quei 18 s si pagherebbero con la
+capacità di caricare più di un adapter, che è il punto della feature.
+
+Numeri agli atti per G6, se un giorno si riapre: il pareggio fra kernel naive e
+MPS cade a **rank ~36**, sotto rank 32 imbottire fa danno, e il caso forte non è
+il rank 64 ma il **rank 128**, dove non imbottire costa **3,4x**. L'ADD vale il
+3% del BASE e fonderlo nell'epilogo della seconda GEMM varrebbe circa quanto il
+padding.
+
+Cautela sulla misura: ogni tempo è preso in un command buffer isolato con
+`waitUntilCompleted`. Dentro il DiT vero questi dispatch stanno nello stesso
+buffer del resto e la GPU può sovrapporli, quindi il **14,7% è un limite
+superiore**. Codice del banco: `tests/bench_lora_gemm.c` su
+`bench/lora-thin-gemm`.
+
+---
+
 ## 8. Requisiti di test
 
 Il repo ha già una suite estesa (`make test`, oltre venti binari fra cui
