@@ -1,5 +1,13 @@
 @AGENTS.md
 
+## Language
+
+Talk to the owner in **Italian**. Everything written down stays in **English**:
+code, comments, commit messages, issues, issue comments, and documentation.
+
+Exception on record: `docs/WHAT.md` was written in Italian before this rule and
+stays that way, so an edit to it matches its existing language.
+
 ## Agent skills
 
 ### Issue tracker

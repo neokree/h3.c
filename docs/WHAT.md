@@ -11,8 +11,7 @@
 | `README.md` del repo | comportamento documentato di `--ssd-streaming` e dello schedule |
 | `minimax_h3_turbo_v4_step600_pruned_comfyui.safetensors` | schema del file LoRA, verbatim in sezione 7 |
 | Header del turbo LoRA upstream non pruned (letto in sessione) | prefisso opzionale, ranghi non uniformi, coppie AdaLN presenti |
-| `gh api` su `ggml-org/llama.cpp` e `leejet/stable-diffusion.cpp` (2026-09-02) | scelta della BAR |
-| Lettura integrale di `llama-adapter.cpp` / `llama-graph.cpp` / `llama-context.cpp` (`docs/research/llama-cpp-adapters.md`, branch `research/llama-cpp-adapters`) | politica di fallimento, rango per coppia, aggiunte al piano di test |
+| Lettura di `llama-adapter.cpp` / `llama-graph.cpp` / `llama-context.cpp` come arte nota (`docs/research/llama-cpp-adapters.md`, branch `research/llama-cpp-adapters`) | politica di fallimento, rango per coppia, aggiunte al piano di test |
 
 **Destinazione di questo documento**: il lavoro di pianificazione in corso produce
 un **design chiuso** — ogni punto aperto reso non ambiguo. L'implementazione è una
@@ -55,9 +54,9 @@ dell'utente che lo invoca. Gli attori sono due, e usano la stessa libreria:
    rango di `A` e quello di `B` discordi.
 
    Questa regola **sostituisce** la formulazione precedente di questo punto
-   ("una incompatibilità è un errore, non un avviso"), che era la politica della
-   BAR: `llama.cpp` aborta sulla prima coppia orfana (`llama-adapter.cpp:331`).
-   La divergenza è deliberata. Un LoRA reale contiene coppie destinate a varianti
+   ("una incompatibilità è un errore, non un avviso"), che è la politica di
+   `llama.cpp`: aborta sulla prima coppia orfana (`llama-adapter.cpp:331`) e
+   perde l'adapter intero. La divergenza è deliberata. Un LoRA reale contiene coppie destinate a varianti
    del modello che `h3` non carica, e abortire renderebbe inutilizzabile un file
    per il resto valido. Il prezzo di questa scelta è la regola **H5**, che rende
    ogni salto visibile.
@@ -101,9 +100,9 @@ Un turbo LoRA a cui manca metà degli adapter deve *dirlo*, non degradare in
 silenzio — è esattamente il modo in cui il file di prova di questa sessione
 sarebbe passato inosservato.
 
-Il **salto** è consentito (sezione 3, punto 3), il **silenzio** no. Anche qui la
-BAR è dietro: `llama.cpp` salta senza dire niente le coppie `_norm.weight`, sotto
-un TODO (`llama-adapter.cpp:287-290`). H5 vieta esattamente questo.
+Il **salto** è consentito (sezione 3, punto 3), il **silenzio** no. `llama.cpp`
+fa l'opposto sulle coppie `_norm.weight`: le salta senza dire niente, sotto un
+TODO (`llama-adapter.cpp:287-290`). H5 vieta esattamente questo.
 
 **H6 — La scala dichiarata dal file vince.** Nelle convenzioni che portano
 `alpha`, il fattore effettivo è `alpha/rank` e va letto dal file, non assunto.
@@ -153,9 +152,7 @@ testuali:
 
 ---
 
-## 6bis. Struttura repo e riferimento
-
-### Struttura
+## 6bis. Struttura repo
 
 Il codice nuovo vive accanto all'esistente, senza cartelle nuove:
 `h3_lora.c` / `h3_lora.h` per il caricamento e la rappresentazione, innesti
@@ -165,25 +162,15 @@ Nessuno script di supporto in Python: la directory `tools/` è stata eliminata e
 non è mai stata committata. L'oracolo di sezione 8 è **dentro il binario di test
 in C**, non fuori.
 
-### BAR — `ggml-org/llama.cpp`
+### Arte nota
 
-Verificato via `gh api repos/ggml-org/llama.cpp` il 2026-09-02:
-`archived: false`, 126.694 star, ultimo push `2026-09-02T00:13:56Z`, linguaggio C++
-con API pubblica in C.
-
-**Perché questo e non `leejet/stable-diffusion.cpp`.** Sono stati esaminati
-entrambi. Il marcatore che decide non è il nome della cartella ma **come il
-delta raggiunge il peso**:
-
-| Repo | File | Marcatore | Esito |
-|---|---|---|---|
-| `leejet/stable-diffusion.cpp` | `src/model/adapter/lora.hpp` | `ggml_add_inplace(compute_ctx, model_tensor, diff)` (riga 937) | **scartato**: somma nel tensore base, incompatibile con H2 |
-| `ggml-org/llama.cpp` | `src/llama-adapter.cpp`, `include/llama.h` | `llama_set_adapters_lora(ctx, adapters, scales, n_adapters)` (riga 713), `llama_adapter_lora_init` (riga 680), `llama_adapter_lora_free` (riga 704) | **scelto**: adapter fuori dai pesi, N simultanei, scala per adapter, liberabili a caldo |
-
-`stable-diffusion.cpp` è più vicino per dominio (diffusione, non LLM) ma la sua
-architettura è precisamente quella che questo progetto vuole abbandonare.
-`llama.cpp` è più lontano per dominio e più vicino per forma, ed è la forma che
-conta: la sua API a tre funzioni è il modello diretto di ciò che serve qui.
+`ggml-org/llama.cpp` e `leejet/stable-diffusion.cpp` sono stati letti come
+precedenti, non come modelli da imitare: le loro scelte compaiono in questo
+documento solo dove servono a giustificare una nostra decisione, con la riga di
+codice accanto. Le due che contano: `stable-diffusion.cpp` somma il delta dentro
+il tensore base (`src/model/adapter/lora.hpp:937`, `ggml_add_inplace`), che H2
+esclude; `llama.cpp` lo somma sull'attivazione, che è la forma compatibile con
+lo streaming. Lettura completa in `docs/research/llama-cpp-adapters.md`.
 
 ---
 
@@ -247,8 +234,8 @@ quest'ultimo. Vanno accettate entrambe le forme.
 sono a rango 16 e tutte le altre a rango 64. Non esiste quindi un "rango del
 file": il rango si legge **per coppia**, dalla forma di `A` (`[rank, in]`) e di
 `B` (`[out, rank]`), e i due valori devono concordare. Se discordano, la coppia è
-internamente incoerente e il caso è fatale (sezione 3, punto 3). La BAR fa la
-stessa cosa, leggendo il rango per coppia da `b->ne[0]` (`llama-adapter.cpp`).
+internamente incoerente e il caso è fatale (sezione 3, punto 3). Anche `llama.cpp`
+legge il rango per coppia, da `b->ne[0]` (`llama-adapter.cpp`).
 
 Metadati del file di prova, verbatim:
 
@@ -465,6 +452,8 @@ stato misurato**. Il tetto si fissa dopo quella misura, non prima.
   `minimax_h3_turbo_v4_step600_pruned_comfyui.safetensors`, letto in sessione.
 - **Forme dei tensori e copertura in byte** — header dei 13 shard di
   `FL2VA/transformer`, letti in sessione.
-- **BAR** — `gh api repos/ggml-org/llama.cpp` e
-  `gh api repos/leejet/stable-diffusion.cpp`, entrambi interrogati il 2026-09-02,
-  più il contenuto di `include/llama.h` e `src/model/adapter/lora.hpp`.
+- **Arte nota** — lettura di `ggml-org/llama.cpp` al commit
+  `de8656bd94f1163188125542534e4bcbc9f9fb1f` (`src/llama-adapter.cpp`,
+  `src/llama-graph.cpp`, `src/llama-context.cpp`, `include/llama.h`) e di
+  `leejet/stable-diffusion.cpp` (`src/model/adapter/lora.hpp`). Note complete in
+  `docs/research/llama-cpp-adapters.md`.
