@@ -48,18 +48,27 @@ dell'utente che lo invoca. Gli attori sono due, e usano la stessa libreria:
    naming**, e normalizza le coppie in una rappresentazione interna unica.
 3. Per ogni coppia, `h3` verifica che il tensore bersaglio esista nel checkpoint
    e che le forme siano compatibili. **Una coppia il cui nome non ha un bersaglio,
-   o la cui forma non entra in un bersaglio supportato, viene segnalata e
-   saltata**: il caricamento prosegue. Sono fatali due soli casi: un file
-   illeggibile o non parsabile, e una coppia internamente incoerente, cioè con il
-   rango di `A` e quello di `B` discordi.
+   o la cui forma non entra in un bersaglio supportato, è fatale**: il caricamento
+   si ferma, il messaggio d'errore le elenca **tutte**, e nessuna generazione
+   parte. Sono fatali anche un file illeggibile o non parsabile e una coppia
+   internamente incoerente, cioè con il rango di `A` e quello di `B` discordi.
 
-   Questa regola **sostituisce** la formulazione precedente di questo punto
-   ("una incompatibilità è un errore, non un avviso"), che è la politica di
-   `llama.cpp`: aborta sulla prima coppia orfana (`llama-adapter.cpp:331`) e
-   perde l'adapter intero. La divergenza è deliberata. Un LoRA reale contiene coppie destinate a varianti
-   del modello che `h3` non carica, e abortire renderebbe inutilizzabile un file
-   per il resto valido. Il prezzo di questa scelta è la regola **H5**, che rende
-   ogni salto visibile.
+   Questo punto è stato rivisto due volte. La formulazione originale ("una
+   incompatibilità è un errore, non un avviso") era stata sostituita da una
+   politica di segnalazione e salto, ritirata il 2026-09-03. Motivo del ritorno al
+   fatale: il salto obbliga il report a portare un canale di comunicazione intero
+   (quante coppie, raggruppate per quale motivo, quante mostrarne prima di
+   inondare il terminale) per un caso che nessun file del corpus produce. Le 208
+   coppie del LoRA di riferimento trovano tutte un bersaglio. Rifiutare il file
+   intero costa all'utente un messaggio invece di un video sbagliato, e toglie dal
+   report la sua sezione più complicata.
+
+   Il prezzo, dichiarato: un file con **una sola** coppia verso un tensore che
+   `h3` non implementa è inutilizzabile finché quel bersaglio non viene aggiunto.
+   Rispetto a `llama.cpp` la divergenza resta, spostata: lì l'abort riporta **solo
+   la prima** coppia orfana (`llama-adapter.cpp:331`) e le coppie `_norm.weight`
+   sono saltate in silenzio sotto un TODO (`:287-290`). Qui l'errore le elenca
+   tutte e non ne salta nessuna.
 4. Gli adapter restano residenti in memoria come tensori separati. **I pesi base
    non vengono mai modificati**, né su disco né nei buffer GPU.
 5. A ogni valutazione del denoiser, per ogni proiezione bersaglio, la GPU calcola
@@ -95,14 +104,17 @@ l'output deve essere **byte-identico** a quello di `h3` prima della modifica,
 a parità di seed e parametri. Nessuna regressione sul percorso senza LoRA.
 
 **H5 — Nessun bersaglio ignorato in silenzio.** Se un file LoRA contiene coppie
-che puntano a tensori che `h3` non applica, l'utente deve vederlo elencato.
-Un turbo LoRA a cui manca metà degli adapter deve *dirlo*, non degradare in
-silenzio — è esattamente il modo in cui il file di prova di questa sessione
-sarebbe passato inosservato.
+che puntano a tensori che `h3` non applica, il caricamento **fallisce** e l'errore
+le elenca tutte. Né il salto né il silenzio sono consentiti (sezione 3, punto 3).
+`llama.cpp` salta le coppie `_norm.weight` senza dire niente, sotto un TODO
+(`llama-adapter.cpp:287-290`): H5 vieta esattamente questo.
 
-Il **salto** è consentito (sezione 3, punto 3), il **silenzio** no. `llama.cpp`
-fa l'opposto sulle coppie `_norm.weight`: le salta senza dire niente, sotto un
-TODO (`llama-adapter.cpp:287-290`). H5 vieta esattamente questo.
+Caso distinto, che H5 **non** copre: le coppie che nel file non ci sono. Un turbo
+LoRA a cui il convertitore ha tolto metà degli adapter non porta coppie orfane,
+ne porta di meno, e non fa scattare nessun errore. A dirlo è il conteggio AdaLN
+sempre dichiarato più l'avviso sulla firma di conversione (sezione 5, punto 1):
+è esattamente il modo in cui il file di prova di questa sessione sarebbe passato
+inosservato.
 
 **H6 — La scala dichiarata dal file vince.** Nelle convenzioni che portano
 `alpha`, il fattore effettivo è `alpha/rank` e va letto dal file, non assunto.
@@ -116,8 +128,16 @@ Non c'è dashboard né export. Gli output secondari richiesti sono tre, tutti
 testuali:
 
 1. **All'attivazione di un LoRA**: percorso, **distribuzione dei ranghi** (non un
-   rango unico, vedi 7.2), numero di coppie applicate, numero di coppie saltate
-   con il motivo (regola H5), **numero di coppie AdaLN**, memoria occupata.
+   rango unico, vedi 7.2), numero di coppie applicate, **numero di coppie AdaLN**,
+   memoria occupata. Non esiste una sezione "coppie saltate": una coppia
+   inapplicabile è fatale (sezione 3, punto 3) e il suo elenco esce dal messaggio
+   d'errore, non dal report.
+
+   **Forma della distribuzione dei ranghi**: istogramma compatto su una riga,
+   ordinato per conteggio decrescente, `ranks: 64 x208, 16 x51`. Non un intervallo
+   (`16-64` nasconde la bimodalità, che è il segnale utile: 16 è l'AdaLN, 64 il
+   backbone) e non un raggruppamento per tipo di bersaglio, che inventerebbe una
+   tassonomia da mantenere a ogni bersaglio nuovo.
 
    Il conteggio delle coppie AdaLN va dichiarato **sempre**, anche quando è zero.
    Zero coppie AdaLN è normale in un LoRA di stile e patologico in un LoRA turbo,
@@ -125,7 +145,22 @@ testuali:
    porta una firma di conversione (`partial_conversion`, `removed_pair_count`,
    `adaln_keys_removed`), va emesso un avviso esplicito che la cita: quel file è
    stato potato da un convertitore e il numero di coppie mancanti è scritto lì.
-2. **`!status`** deve elencare i LoRA attivi con la rispettiva strength.
+
+   **Come si distinguono i due**: per prefisso e posizione di riga, non per
+   colore. Il conteggio è un campo della riga di riepilogo normale
+   (`AdaLN pairs: 51`); l'avviso è una **riga separata che inizia con `warning:`**
+   e **cita i valori dell'header verbatim** (`removed_pair_count=51`,
+   `partial_conversion=true`) invece di parafrasarli. Il file sa più di `h3` su
+   cosa gli è stato tolto, e riscriverlo a parole perde il numero.
+2. **`!status`** elenca i LoRA attivi con la rispettiva strength su **una riga
+   sola**, con il basename e non il percorso intero:
+   `LoRA: style.safetensors 0.80, turbo.safetensors 1.00`, e `LoRA: none` quando
+   l'insieme è vuoto. Il precedente in casa è `!refs`, che stampa un conteggio e
+   rimanda a un comando dedicato (`h3_cli.c:206`). Il report completo del punto 1
+   esce **una volta sola all'attivazione**, cioè su `!lora add` attraverso
+   `h3_lora_preload`, che risponde nell'istante in cui lo digiti perché legge solo
+   gli header (sezione 6ter, punto 3). `!lora` nudo ripete l'elenco lungo su
+   richiesta.
 3. **`--profile`** — requisito **ritirato**. L'API di profiling del repo è
    due funzioni (`h3_gpu.h:98-99`), `h3_gpu_profile_set_label` e
    `h3_gpu_profile_mark(gpu, phase)`: marcatori di fase grossolani, nient'altro.
@@ -297,7 +332,10 @@ Metadati del file di prova, verbatim:
              Four-step distillation behaviour may be degraded or broken."}
 ```
 
-Quel `warning` è il motivo per cui la regola **H5** esiste.
+Quel `warning` è il motivo per cui esistono il conteggio AdaLN sempre dichiarato
+e l'avviso di conversione (sezione 5, punto 1). Le 51 coppie potate **non sono
+orfane, sono assenti**: nessun controllo di forma le vede, quindi non fanno
+scattare il fatale di H5. Solo l'header del file sa che c'erano.
 
 ### 7.3 Convenzioni: cosa si supporta e cosa si rifiuta
 
@@ -418,12 +456,17 @@ scritto dal convertitore.
 che contiene esso stesso un `:`**. Lo split sull'ultimo `:` è la regola sottile
 di G3 e va coperta da un test, non dalla lettura del codice.
 
-**T4 — Rifiuto e segnalazione.** Tre casi distinti, con esiti distinti:
-un LoRA con coppie verso tensori che `h3` non applica deve **elencarle e
-proseguire** (H5 e sezione 3 punto 3); una coppia internamente incoerente, con i
-ranghi di `A` e `B` discordi, deve **fallire**; un file **troncato**, cioè con un
-header valido e i dati incompleti, deve fallire con un errore che dice che è
-troncato, non con un crash.
+**T4 — Rifiuto e segnalazione.** Tre casi, tutti fatali, con messaggi distinti:
+un LoRA con coppie verso tensori che `h3` non applica deve fallire **elencandole
+tutte**, non solo la prima (H5 e sezione 3 punto 3); una coppia internamente
+incoerente, con i ranghi di `A` e `B` discordi, deve fallire; un file **troncato**,
+cioè con un header valido e i dati incompleti, deve fallire con un errore che dice
+che è troncato, non con un crash.
+
+**T4b — Forma del report.** Su un file valido, la riga dei ranghi è l'istogramma
+di sezione 5 punto 1 e il conteggio AdaLN c'è anche quando vale zero. Su un file
+con firma di conversione, esce in più una riga `warning:` che contiene il valore
+di `removed_pair_count` letto dall'header.
 
 **T5 — Composizione.** Due LoRA attivi insieme danno lo stesso risultato di un
 singolo LoRA i cui delta sono la somma dei due, entro la tolleranza di T1.
