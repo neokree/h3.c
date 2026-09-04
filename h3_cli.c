@@ -2,6 +2,7 @@
 
 #include "h3_ffmpeg.h"
 #include "h3_host.h"
+#include "h3_lora.h"
 #include "h3_terminal.h"
 #include "linenoise.h"
 
@@ -27,6 +28,10 @@ typedef struct {
     const char *model_dir;
     h3_params params;
     h3_reference references[12];
+    /* The session's LoRA list, edited in place by !lora and copied into
+     * h3_params per generation. No static cap on adapters (G4). */
+    h3_lora *loras;
+    size_t lora_count;
     char *first_frame;
     char *last_frame;
     char output_dir[H3_CLI_PATH];
@@ -146,6 +151,83 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
     return 0;
 }
 
+/* Every line carries the "h3: " prefix, not just the first: a report can
+ * interleave with the \r progress line, and an unprefixed continuation is
+ * indistinguishable from model output (SPEC 5bis.1). The library prints
+ * nothing for itself. */
+static void cli_report(const char *line, void *opaque) {
+    h3_cli_state *state = opaque;
+    if (state->progress_active) {
+        fputc('\n', stderr);
+        state->progress_active = 0;
+    }
+    fprintf(stderr, "h3: %s\n", line);
+}
+
+/* ---- the session's LoRA list ---- */
+
+static const char *base_name(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+static size_t find_lora(const h3_cli_state *state, const char *path) {
+    for (size_t index = 0; index < state->lora_count; index++)
+        if (!strcmp(state->loras[index].path, path)) return index;
+    return state->lora_count;
+}
+
+static int append_lora(h3_cli_state *state, const char *path, float strength) {
+    h3_lora *grown = realloc(state->loras,
+                             (state->lora_count + 1) * sizeof(*grown));
+    if (!grown) return 0;
+    state->loras = grown;
+    char *copy = strdup(path);
+    if (!copy) return 0;
+    grown[state->lora_count].path = copy;
+    grown[state->lora_count].strength = strength;
+    state->lora_count++;
+    return 1;
+}
+
+static void free_loras(h3_cli_state *state) {
+    for (size_t index = 0; index < state->lora_count; index++)
+        free((char *)state->loras[index].path);
+    free(state->loras);
+    state->loras = NULL;
+    state->lora_count = 0;
+}
+
+/* The one !status line: basenames, never the whole path (SPEC 5.2). */
+static void print_lora_status(const h3_cli_state *state) {
+    if (!state->lora_count) {
+        puts("LoRA: none");
+        return;
+    }
+    fputs("LoRA:", stdout);
+    for (size_t index = 0; index < state->lora_count; index++)
+        printf("%s %s %.2f", index ? "," : "",
+               base_name(state->loras[index].path),
+               (double)state->loras[index].strength);
+    putchar('\n');
+}
+
+/* ponytail: bare !lora lists the full paths one per line, the shape !refs
+ * already uses. It does not re-emit the activation report: the only way to
+ * repeat that would be to drop the cache entry and re-parse, which would
+ * leave the prepared DiT keyed on an adapter that no longer exists. */
+static void list_loras(const h3_cli_state *state) {
+    if (!state->lora_count) {
+        puts("LoRA: none");
+        return;
+    }
+    puts("Active LoRA adapters:");
+    for (size_t index = 0; index < state->lora_count; index++)
+        printf("  %zu. %-6.2f %s\n", index + 1,
+               (double)state->loras[index].strength,
+               state->loras[index].path);
+}
+
 static void print_help(void) {
     puts("Commands:");
     puts("  !help                    Show this help");
@@ -168,6 +250,10 @@ static void print_help(void) {
     puts("  !ref-image PATH          Append an ordered Ref2VA image");
     puts("  !refs [clear]            List or clear ordered references");
     puts("  !ref-remove N            Remove ordered reference N");
+    puts("  !lora                    List the active LoRA adapters");
+    puts("  !lora add PATH [S]       Add an adapter at strength S (default 1.0)");
+    puts("  !lora set PATH S         Change an adapter's strength");
+    puts("  !lora remove PATH        Drop an adapter");
     puts("  !show [on|off]           Toggle denoising previews");
     puts("  !zoom N                  Set terminal image zoom");
     puts("  !open [on|off]           Toggle opening completed videos");
@@ -204,6 +290,7 @@ static void print_status(const h3_cli_state *state) {
     printf("Last: %s\n", state->last_frame ? state->last_frame : "none");
     printf("References: %zu%s\n", state->params.reference_count,
            state->params.reference_count ? " (use !refs to list)" : "");
+    print_lora_status(state);
     printf("Show: %s | open: %s | output: %s\n",
            state->show ? "on" : "off", state->open_output ? "on" : "off",
            state->output_dir);
@@ -439,6 +526,11 @@ static int generate(h3_cli_state *state, const char *prompt) {
     params.preview_denoise = state->show && state->terminal != H3_TERM_NONE;
     params.on_frame = params.preview_denoise ? cli_frame : NULL;
     params.on_progress = cli_progress;
+    params.on_report = cli_report;
+    /* The active set is replaced wholesale per generation (SPEC 6ter.8), and
+     * the list has moved if it was grown since the last one. */
+    params.loras = state->loras;
+    params.lora_count = state->lora_count;
     params.callback_opaque = state;
     state->phase[0] = '\0';
     state->progress_active = 0;
@@ -480,6 +572,95 @@ static int set_integer(char *argument, const char *name, int minimum,
     *slot = value;
     printf("%s: %d\n", name, *slot);
     return 1;
+}
+
+static char *next_token(char **cursor) {
+    char *text = skip_spaces(*cursor);
+    if (!*text) {
+        *cursor = text;
+        return NULL;
+    }
+    char *end = text;
+    while (*end && !isspace((unsigned char)*end)) end++;
+    if (*end) *end++ = '\0';
+    *cursor = end;
+    return text;
+}
+
+/* Same domain as --lora on the other surface: anything finite, and nothing
+ * else (SPEC 4). Only the reaction differs. */
+static int parse_strength(const char *text, float *value) {
+    char *end = NULL;
+    errno = 0;
+    float parsed = strtof(text, &end);
+    while (end && isspace((unsigned char)*end)) end++;
+    if (errno || end == text || !end || *end || !isfinite(parsed)) return 0;
+    *value = parsed;
+    return 1;
+}
+
+static void lora_command(h3_cli_state *state, char *argument) {
+    char *cursor = argument;
+    char *action = next_token(&cursor);
+    if (!action) {
+        list_loras(state);
+        return;
+    }
+    char *path = next_token(&cursor);
+    char *strength_text = next_token(&cursor);
+    int adding = !strcasecmp(action, "add");
+    int setting = !strcasecmp(action, "set");
+    int dropping = !strcasecmp(action, "remove");
+    if ((!adding && !setting && !dropping) || !path || next_token(&cursor) ||
+        (setting && !strength_text) || (dropping && strength_text)) {
+        fputs("Usage: !lora [add PATH [STRENGTH] | set PATH STRENGTH | "
+              "remove PATH]\n", stderr);
+        return;
+    }
+    size_t index = find_lora(state, path);
+    if (!adding && index == state->lora_count) {
+        fprintf(stderr, "h3: %s is not in the active set\n", path);
+        return;
+    }
+    if (dropping) {
+        free((char *)state->loras[index].path);
+        for (size_t next = index + 1; next < state->lora_count; next++)
+            state->loras[next - 1] = state->loras[next];
+        state->lora_count--;
+        h3_lora_release(state->ctx, path);
+        print_lora_status(state);
+        return;
+    }
+    float strength = 1.0f;
+    if (strength_text && !parse_strength(strength_text, &strength)) {
+        /* Keeping the previous value silently would let the user believe
+         * something changed, so it is named (SPEC 5bis.4). A first add has
+         * no previous value to keep, so it simply does not land. */
+        if (index < state->lora_count)
+            fprintf(stderr, "lora: invalid strength: %s; keeping %.2f\n",
+                    strength_text, (double)state->loras[index].strength);
+        else
+            fprintf(stderr, "lora: invalid strength: %s\n", strength_text);
+        return;
+    }
+    /* Validate before touching the list: a fatal load leaves the previous
+     * active set in place, and the CLI says so (SPEC 5bis.6). A new strength
+     * reloads nothing, params carries it. */
+    if (adding && !h3_lora_preload(state->ctx, path, cli_report, state)) {
+        fprintf(stderr, "h3: %s\n", h3_last_error(state->ctx));
+        fputs("h3: the active set is unchanged\n", stderr);
+        return;
+    }
+    if (index == state->lora_count) {
+        if (!append_lora(state, path, strength)) {
+            fprintf(stderr, "h3: out of memory adding %s\n", path);
+            fputs("h3: the active set is unchanged\n", stderr);
+            return;
+        }
+    } else {
+        state->loras[index].strength = strength;
+    }
+    print_lora_status(state);
 }
 
 static int process_command(h3_cli_state *state, char *line, int *repeat) {
@@ -625,7 +806,8 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
             clear_references(state);
             puts("References: none");
         } else fprintf(stderr, "h3: use !refs or !refs clear\n");
-    } else if (!strcasecmp(command, "ref-remove"))
+    } else if (!strcasecmp(command, "lora")) lora_command(state, argument);
+    else if (!strcasecmp(command, "ref-remove"))
         remove_reference(state, argument);
     else if (!strcasecmp(command, "show")) {
         int value;
@@ -706,7 +888,12 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
     state.params.last_frame = NULL;
     state.params.on_frame = NULL;
     state.params.on_progress = NULL;
+    state.params.on_report = NULL;
     state.params.callback_opaque = NULL;
+    const h3_lora *initial_loras = initial->loras;
+    size_t initial_lora_count = initial->lora_count;
+    state.params.loras = NULL;
+    state.params.lora_count = 0;
     state.random_seed = !seed_was_given;
     state.terminal = h3_terminal_detect();
     state.show = show && state.terminal != H3_TERM_NONE;
@@ -733,12 +920,27 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
         }
         state.params.reference_count++;
     }
+    /* Adapters given with --lora start the session active, the way an anchor
+     * or a reference given on the command line does. */
+    for (size_t index = 0; index < initial_lora_count; index++) {
+        if (!initial_loras || !initial_loras[index].path ||
+            !append_lora(&state, initial_loras[index].path,
+                         initial_loras[index].strength)) {
+            fprintf(stderr, "h3: cannot copy initial LoRA %zu\n", index + 1);
+            free_loras(&state);
+            clear_references(&state);
+            free(state.first_frame);
+            free(state.last_frame);
+            return 1;
+        }
+    }
     snprintf(state.output_dir, sizeof(state.output_dir), "/tmp/h3-XXXXXX");
     if (!mkdtemp(state.output_dir)) {
         fprintf(stderr, "h3: cannot create session directory: %s\n",
                 strerror(errno));
         free(state.first_frame);
         free(state.last_frame);
+        free_loras(&state);
         clear_references(&state);
         return 1;
     }
@@ -787,6 +989,7 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
     free(state.first_frame);
     free(state.last_frame);
     free(state.last_prompt);
+    free_loras(&state);
     clear_references(&state);
     puts("Goodbye.");
     return 0;

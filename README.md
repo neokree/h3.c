@@ -35,8 +35,8 @@ Without `-p`, the same binary starts an Iris-style interactive session:
 Type a prompt to generate a numbered video. The session keeps the exact BF16
 prompt conditioning, prepared DiT, and video decoder in memory, so repeating a
 prompt with another seed avoids loading and encoding them again. Useful commands
-are `!status`, `!seed random`, `!seconds 2`, `!show`, `!save output.mp4`, and
-`!cache`. Use `!help` for the full, short list.
+are `!status`, `!seed random`, `!seconds 2`, `!show`, `!save output.mp4`,
+`!lora`, and `!cache`. Use `!help` for the full, short list.
 
 First/last-frame conditioning is persistent in the session:
 
@@ -403,6 +403,51 @@ Standalone audio must accompany an image or video reference. Audio references
 must be 2–15 seconds; at most three audio inputs are accepted and their total
 decoded duration is capped at 15 seconds.
 
+### 9. Apply a LoRA adapter
+
+`--lora PATH[:STRENGTH]` applies a LoRA adapter to the DiT at run time; nothing
+is written into the checkpoint. The flag is repeatable and adapters are applied
+in the order given. `STRENGTH` is optional and defaults to `1.0`; it multiplies
+the `alpha/rank` scale the file declares for itself, and any finite value is
+accepted, including a negative one. Strength `0` validates the file and then
+applies nothing.
+
+```sh
+./h3 -d ./MiniMax-H3 -p "A red fox walks through fresh snow." \
+  --width 448 --height 576 --frames 22 --steps 20 --ssd-streaming \
+  --lora loras/turbo.safetensors:0.65 \
+  --lora loras/style.safetensors \
+  -o outputs/fox-lora.mp4
+```
+
+The path is split on its **last** colon, because a colon is legal in a macOS
+file name: `--lora refs/turbo:v2.safetensors:0.65` reads as that file at
+strength `0.65`. A tail that is not a finite number is rejected rather than
+taken as part of the path, so a typo names itself:
+
+```text
+h3: invalid --lora strength: 0.8x (in loras/style.safetensors:0.8x)
+```
+
+In an interactive session the same adapters are edited as a list:
+
+```text
+h3> !lora add loras/turbo.safetensors 0.65
+h3> !lora set loras/turbo.safetensors 0.8
+h3> !lora remove loras/turbo.safetensors
+h3> !lora
+```
+
+`!lora add` validates the file against the checkpoint header immediately, so
+its report appears as you type the command instead of at the next generation.
+Bare `!lora` lists what is active with full paths, and `!status` carries the
+same list on one line with basenames. A malformed strength on `!lora set`
+keeps the previous value and says which one it kept; a file that fails to load
+leaves the previous set in place.
+
+Adapters requested on the command line stay active when the session starts
+without `-p`, so `--lora` and `!lora` describe one list.
+
 ## Tests and runtime requirements
 
 ```sh
@@ -418,6 +463,41 @@ toolchain. The test covers both an F32 diagnosis path and the production BF16
 storage path; wide BF16 matrix products and SDPA use cached MPSGraph graphs, with
 direct Metal correctness fallbacks. `make parity` runs only those Metal/MLX
 checks.
+
+### LoRA test corpus
+
+`make test` never needs a LoRA: the parser, command-line and report checks write
+their own eleven safetensors fixtures into a temporary directory at every run
+and delete them on exit, so they run and pass on a machine with no checkpoint.
+
+The numerical LoRA checks are a separate target, `make real-lora`, on the model
+of `make real-parity`: no `test -f` guards, it fails hard when a file is
+missing. It wants the FL2VA checkpoint plus two adapters, neither of which is in
+the repo (both exceed GitHub's 100 MB limit and are third-party
+redistributions):
+
+| Path | File | Size |
+|---|---|---|
+| `loras/turbo.safetensors` | `minimax_h3_turbo_v4_step600_pruned_comfyui.safetensors` | 591.6 MB |
+| `loras/combat.safetensors` | `H3_Combat_V2.safetensors` | 147.9 MB |
+
+Download both, then point the two names at them; a symlink is enough and keeps
+the files out of the working tree:
+
+```sh
+mkdir -p loras
+ln -s /path/to/minimax_h3_turbo_v4_step600_pruned_comfyui.safetensors \
+      loras/turbo.safetensors
+ln -s /path/to/H3_Combat_V2.safetensors loras/combat.safetensors
+make real-lora
+```
+
+The first is rank 64, the second rank 16, which is why both are needed: one
+covers the branch at each rank, and together they cover composition of two
+adapters at different ranks. `make real-lora` also generates video five times
+over (two in `lora-identity`, three in `lora-hotswap`, both runnable on their
+own), at `448x576`, 22 frames and 4 steps: roughly ninety seconds per
+generation on an M4 Pro, about seven minutes for the two targets together.
 
 FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 (`H3_FFMPEG` and `H3_FFPROBE` may select explicit executables). Generated RGB24 and

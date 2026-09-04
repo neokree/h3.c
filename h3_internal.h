@@ -7,6 +7,7 @@
 #include <stdarg.h>
 
 struct h3_dit;
+struct h3_lora_adapter;
 struct h3_video_vae_decoder;
 
 struct h3_ctx {
@@ -31,6 +32,8 @@ struct h3_ctx {
     struct h3_dit *dit;
     char *video_decoder_key;
     struct h3_video_vae_decoder *video_decoder;
+    /* Parsed LoRA adapters, keyed by path plus size plus mtime. */
+    struct h3_lora_adapter *loras;
 };
 
 void h3_set_error(h3_ctx *ctx, const char *format, ...)

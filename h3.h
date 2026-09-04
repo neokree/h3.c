@@ -58,9 +58,21 @@ typedef struct {
     int denoise_steps;
 } h3_frame;
 
+/* One requested LoRA adapter. Declarative: nothing here is owned by the
+ * caller past the h3_generate call, and nothing to free. */
+typedef struct {
+    const char *path;
+    float strength;
+} h3_lora;
+
 typedef int (*h3_frame_callback)(const h3_frame *frame, void *opaque);
 typedef int (*h3_progress_callback)(const char *phase, int completed, int total,
                                     void *opaque);
+/* Report and diagnostic lines, without the "h3: " prefix the CLI adds. The
+ * return is void on purpose: a report has nothing to cancel, and a non-zero
+ * return would have to mean cancel, which overwrites the very error message
+ * the lines are describing. */
+typedef void (*h3_report_callback)(const char *line, void *opaque);
 
 typedef struct {
     int width;
@@ -123,15 +135,21 @@ typedef struct {
     int use_slower_grouped_quantizer;
     /* Decode and deliver one representative frame after every Euler step. */
     int preview_denoise;
+    /* Adapters requested for this generation, in the order they were given.
+     * Entries at strength 0 are dropped while the active set is built. */
+    const h3_lora *loras;
+    size_t lora_count;
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
+    h3_report_callback on_report;
     void *callback_opaque;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+    NULL, 0, NULL, NULL, NULL, NULL \
 }
 
 typedef struct {

@@ -1,6 +1,7 @@
 #include "h3.h"
 #include "h3_cli.h"
 #include "h3_host.h"
+#include "h3_lora.h"
 #include "h3_terminal.h"
 
 #include <errno.h>
@@ -48,6 +49,8 @@ static void usage(const char *program) {
         "      --seed N           Random seed (default: 42)\n"
         "      --first-frame PATH First-frame conditioning image\n"
         "      --last-frame PATH  Last-frame conditioning image\n"
+        "      --lora PATH[:STRENGTH]  Apply a LoRA adapter (default 1.0,\n"
+        "                         repeatable)\n"
         "      --ref-image PATH    Append an ordered Ref2VA image\n"
         "      --ref-image-size S  Image sizing: match (default) or max\n"
         "      --ref-video PATH    Append video, including embedded audio\n"
@@ -101,6 +104,18 @@ static uint64_t parse_u64(const char *value, const char *label) {
         exit(2);
     }
     return (uint64_t)parsed;
+}
+
+/* --lora PATH[:STRENGTH]. The last-colon rule itself lives in h3_lora.c so a
+ * test can reach it (SPEC 8, T3b); `argument` is argv memory, truncated in
+ * place at the colon. */
+static void parse_lora(char *argument, h3_lora *lora) {
+    const char *tail = NULL;
+    if (!h3_lora_parse_argument(argument, lora, &tail)) {
+        fprintf(stderr, "h3: invalid --lora strength: %s (in %s)\n", tail,
+                argument);
+        exit(2);
+    }
 }
 
 static h3_reference *append_reference(h3_reference references[12],
@@ -169,6 +184,18 @@ static int cli_progress(const char *phase, int completed, int total,
     if (!state->active) fputc('\n', stderr);
     fflush(stderr);
     return 0;
+}
+
+/* Every line carries the "h3: " prefix, not just the first: a report can
+ * interleave with the \r progress line, and an unprefixed continuation is
+ * indistinguishable from model output (SPEC 5bis.1). */
+static void cli_report(const char *line, void *opaque) {
+    cli_state *state = opaque;
+    if (state->active) {
+        fputc('\n', stderr);
+        state->active = 0;
+    }
+    fprintf(stderr, "h3: %s\n", line);
 }
 
 static int cli_frame(const h3_frame *frame, void *opaque) {
@@ -250,7 +277,7 @@ int main(int argc, char **argv) {
            OPT_SEED,
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
-           OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
+           OPT_REF_AUDIO, OPT_LORA, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
            OPT_PROFILE, OPT_INFO };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
@@ -299,6 +326,7 @@ int main(int argc, char **argv) {
         {"ref-silent-video", required_argument, NULL, OPT_REF_SILENT_VIDEO},
         {"ref-video-audio", required_argument, NULL, OPT_REF_VIDEO_AUDIO},
         {"ref-audio", required_argument, NULL, OPT_REF_AUDIO},
+        {"lora", required_argument, NULL, OPT_LORA},
         {"frames-dir", required_argument, NULL, OPT_FRAMES_DIR},
         {"show", no_argument, NULL, OPT_SHOW},
         {"zoom", required_argument, NULL, OPT_ZOOM},
@@ -313,6 +341,13 @@ int main(int argc, char **argv) {
     h3_params params = H3_PARAMS_DEFAULT;
     h3_reference references[12];
     size_t reference_count = 0;
+    /* No static cap on adapters (G4): at most one per argv slot. */
+    h3_lora *loras = calloc((size_t)argc, sizeof(*loras));
+    size_t lora_count = 0;
+    if (!loras) {
+        fprintf(stderr, "h3: out of memory\n");
+        return 1;
+    }
     cli_state cli = {{0}, 0, -1, -1, H3_TERM_NONE, 0, NULL, 0};
     int show = 0;
     int profile = 0;
@@ -451,6 +486,7 @@ int main(int argc, char **argv) {
                 reference->path = optarg;
                 break;
             }
+            case OPT_LORA: parse_lora(optarg, &loras[lora_count++]); break;
             case OPT_FRAMES_DIR: cli.frames_dir = optarg; break;
             case OPT_SHOW: show = 1; break;
             case OPT_ZOOM:
@@ -480,6 +516,8 @@ int main(int argc, char **argv) {
     }
     params.references = references;
     params.reference_count = reference_count;
+    params.loras = loras;
+    params.lora_count = lora_count;
     if (cli.frames_dir && mkdir(cli.frames_dir, 0755) != 0 &&
         errno != EEXIST) {
         fprintf(stderr, "h3: cannot create frames directory %s: %s\n",
@@ -496,6 +534,7 @@ int main(int argc, char **argv) {
     if (prompt) {
         params.output_path = output;
         params.on_progress = cli_progress;
+        params.on_report = cli_report;
         params.callback_opaque = &cli;
         if (cli.frames_dir) params.on_frame = cli_frame;
         if (show) {

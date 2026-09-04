@@ -46,6 +46,13 @@ typedef struct {
     h3_gpu_tensor *fc1_scales;
     h3_gpu_tensor *fc2_int8;
     h3_gpu_tensor *fc2_scales;
+    /* SPEC 7.1: one site per targeted projection. Zeroed unless the active
+     * set carries a pair for this block, so a block with no LoRA costs
+     * nothing and dispatches nothing (H4). */
+    h3_lora_site lora_qkv;
+    h3_lora_site lora_out;
+    h3_lora_site lora_fc1;
+    h3_lora_site lora_fc2;
 } h3_dit_block;
 
 enum {
@@ -195,7 +202,27 @@ struct h3_dit {
     h3_gpu_tensor *video_output_bf16;
     h3_gpu_tensor *previous_audio_velocity;
     h3_gpu_tensor *previous_video_velocity;
+    /* SPEC 7bis.4: one shared bf16 intermediate for every branch of every
+     * projection of every block, sized on the active set's maximum rank, plus
+     * one shared delta of the widest targeted output. Both are allocated at
+     * load, so the denoise loop still allocates nothing. */
+    h3_gpu_tensor *lora_hidden;
+    h3_gpu_tensor *lora_delta;
+    /* Borrowed from the caller and valid only while load_dit runs: the set is
+     * consumed into the sites above and the pointer is dropped before the
+     * loaded DiT outlives the caller's set. */
+    const h3_lora_set *loras;
+    /* Gate 2 of the G4 guardrail, armed by the caller after the load. A zero
+     * ceiling is a DiT nobody armed, and costs one comparison per run. */
+    h3_memory_ceiling memory_ceiling;
+    int memory_gate_done;
 };
+
+void h3_dit_arm_memory_gate(h3_dit *dit, const h3_memory_ceiling *ceiling) {
+    if (!dit || !ceiling) return;
+    dit->memory_ceiling = *ceiling;
+    dit->memory_gate_done = 0;
+}
 
 static void fail(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
@@ -499,6 +526,26 @@ static uint32_t token_reduced_parent(const h3_dit *dit, uint32_t full_row) {
            (local % spatial_width) / 2;
 }
 
+/* The four sites of one block, resolved by target name. Both weight paths go
+ * through here, and so do the two token-refiner blocks (SPEC 7.1, 7bis.2). */
+static int load_block_loras(h3_dit *dit, h3_dit_block *block,
+                            const char *prefix,
+                            char *error, size_t error_size) {
+    if (!dit->loras || !dit->loras->count) return 1;
+    char name[160];
+#define SITE(field, suffix) do {                                               \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                      \
+    if (!h3_lora_site_build(dit->loras, dit->gpu, name, &block->field,         \
+                            error, error_size)) return 0;                      \
+} while (0)
+    SITE(lora_qkv, "attn.qkv_proj");
+    SITE(lora_out, "attn.out_proj");
+    SITE(lora_fc1, "mlp.fc1");
+    SITE(lora_fc2, "mlp.fc2");
+#undef SITE
+    return 1;
+}
+
 static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
                       char *error, size_t error_size) {
     char name[160];
@@ -522,7 +569,7 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
     LOAD2(fc2, "mlp.fc2.weight", HIDDEN, FFN);
 #undef LOAD1
 #undef LOAD2
-    return 1;
+    return load_block_loras(dit, block, prefix, error, error_size);
 }
 
 static int load_block_norms(h3_dit *dit, h3_dit_block *block,
@@ -539,7 +586,7 @@ static int load_block_norms(h3_dit *dit, h3_dit_block *block,
     LOAD1(q_norm, "attn.q_norm.weight", HEAD_DIM);
     LOAD1(k_norm, "attn.k_norm.weight", HEAD_DIM);
 #undef LOAD1
-    return 1;
+    return load_block_loras(dit, block, prefix, error, error_size);
 }
 
 static void free_block(h3_dit_block *block) {
@@ -559,6 +606,10 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->fc1_scales);
     free_tensor(&block->fc2_int8);
     free_tensor(&block->fc2_scales);
+    h3_lora_site_free(&block->lora_qkv);
+    h3_lora_site_free(&block->lora_out);
+    h3_lora_site_free(&block->lora_fc1);
+    h3_lora_site_free(&block->lora_fc2);
 }
 
 static double stream_now(void) {
@@ -760,6 +811,19 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
     return 1;
 }
 
+/* SPEC 7bis.4: the delta path, shared with the AdaLN precompute
+ * (h3_dit_schedule.c) through h3_lora_dispatch_branch. This wrapper only
+ * supplies this DiT's own scratch tensors and the "LoRA" label that keeps its
+ * dispatch failures distinguishable from the AdaLN ones. */
+static int lora_branch(h3_dit *dit, const h3_lora_site *site,
+                       h3_gpu_tensor *y, const h3_gpu_tensor *x,
+                       uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                       char *error, size_t error_size) {
+    return h3_lora_dispatch_branch(dit->gpu, site, y, x, dit->lora_hidden,
+                                   dit->lora_delta, rows, input_dim,
+                                   output_dim, "LoRA", error, error_size);
+}
+
 static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
                              h3_gpu_tensor *hidden, h3_gpu_tensor *norm,
                              h3_gpu_tensor *qkv, h3_gpu_tensor *query,
@@ -775,6 +839,8 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
                              HIDDEN, 1e-5f), "refiner attention norm");
     OP(h3_gpu_linear_bf16(dit->gpu, qkv, norm, weight->qkv, NULL, rows,
                            HIDDEN, INNER * 3), "refiner QKV");
+    if (!lora_branch(dit, &weight->lora_qkv, qkv, norm, rows, HIDDEN,
+                     INNER * 3, error, error_size)) return 0;
     OP(h3_gpu_grouped_qkv_rope_bf16(
                              dit->gpu, query, key, value, qkv, weight->q_norm,
                              weight->k_norm, weight->q_norm, weight->q_norm,
@@ -785,16 +851,22 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
        "refiner attention");
     OP(h3_gpu_linear_bf16(dit->gpu, branch, heads, weight->out, NULL, rows,
                            INNER, HIDDEN), "refiner attention output");
+    if (!lora_branch(dit, &weight->lora_out, branch, heads, rows, INNER,
+                     HIDDEN, error, error_size)) return 0;
     OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
        "refiner attention residual");
     OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm2, rows,
                              HIDDEN, 1e-5f), "refiner MLP norm");
     OP(h3_gpu_linear_bf16(dit->gpu, fc1, norm, weight->fc1, NULL, rows,
                            HIDDEN, FFN * 2), "refiner MLP input");
+    if (!lora_branch(dit, &weight->lora_fc1, fc1, norm, rows, HIDDEN,
+                     FFN * 2, error, error_size)) return 0;
     OP(h3_gpu_swiglu_bf16(dit->gpu, activated, fc1, rows, FFN),
        "refiner SwiGLU");
     OP(h3_gpu_linear_bf16(dit->gpu, branch, activated, weight->fc2, NULL,
                            rows, FFN, HIDDEN), "refiner MLP output");
+    if (!lora_branch(dit, &weight->lora_fc2, branch, activated, rows, FFN,
+                     HIDDEN, error, error_size)) return 0;
     OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
        "refiner MLP residual");
 #undef OP
@@ -1581,6 +1653,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         size_t condition_video_elements,
                         const float *condition_audio_rows,
                         size_t condition_audio_elements,
+                        const h3_lora_set *loras,
                         h3_dit_progress progress, void *progress_opaque,
                         char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
@@ -1662,6 +1735,41 @@ static h3_dit *load_dit(const char *weight_directory,
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||
          getenv("H3_INT8_MLP_STAGE"));
+    /* The delta is added to the output of a bf16 op, so the op has to be
+     * there: the MPSGraph MLP hides the raw fc1 output and the int8 paths hide
+     * every projection the branch targets. G5 leaves int8 out of scope, so an
+     * active set selects the unfused bf16 path instead of silently applying no
+     * delta. With an empty set nothing here runs and the dispatch loop is the
+     * one h3 had before (H4). */
+    if (loras && loras->count) {
+        dit->fused_mlp = 0;
+        dit->nax_mlp = 0;
+        dit->int8_mlp = 0;
+        dit->int8_qkv = 0;
+        dit->int8_attention_out = 0;
+        dit->keep_bf16_qkv = 0;
+        dit->keep_bf16_attention_out = 0;
+        dit->keep_bf16_mlp = 0;
+        dit->use_int8_row_fc2 = 0;
+        dit->loras = loras;
+        uint64_t max_rank = 0, max_out_dim = 0;
+        h3_lora_set_extents(loras, &max_rank, &max_out_dim);
+        /* SPEC 7bis.4: one shared intermediate on the maximum rank, because
+         * the rank is a property of the pair, plus one shared delta. Allocated
+         * here, at load, so the denoise loop keeps reporting alloc=0.000GiB. */
+        if (max_rank) {
+            dit->lora_hidden = h3_gpu_tensor_new_bf16(
+                dit->gpu, (size_t)dit->sequence * max_rank);
+            dit->lora_delta = h3_gpu_tensor_new_bf16(
+                dit->gpu, (size_t)dit->sequence * max_out_dim);
+            if (!dit->lora_hidden || !dit->lora_delta) {
+                fail(error, error_size,
+                     "cannot allocate the LoRA branch scratch: %s",
+                     h3_gpu_error(dit->gpu));
+                goto failed;
+            }
+        }
+    }
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
@@ -1669,8 +1777,8 @@ static h3_dit *load_dit(const char *weight_directory,
     schedule_progress schedule_state = {progress, progress_opaque};
     dit->schedule = h3_dit_schedule_precompute(
         dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
-        dit->audio_condition_rows != 0, schedule_report, &schedule_state,
-        error, error_size);
+        dit->audio_condition_rows != 0, dit->loras, schedule_report,
+        &schedule_state, error, error_size);
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
         h3_dit_schedule_prune(dit->schedule, dit->block_active,
@@ -1691,6 +1799,8 @@ static h3_dit *load_dit(const char *weight_directory,
         fail(error, error_size, "cannot write persistent DiT condition rows");
         goto failed;
     }
+    /* Every branch is materialised: the caller is free to drop its set. */
+    dit->loras = NULL;
     h3_gpu_profile_mark(dit->gpu, "load");
     return dit;
 failed:
@@ -1719,6 +1829,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
+                         const h3_lora_set *loras,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
@@ -1735,7 +1846,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
                     use_int8_row_fc2,
-                    NULL, 0, NULL, 0, progress, progress_opaque,
+                    NULL, 0, NULL, 0, loras, progress, progress_opaque,
                     error, error_size);
 }
 
@@ -1765,6 +1876,7 @@ h3_dit *h3_dit_load_conditioned(
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
                          size_t condition_audio_elements,
+                         const h3_lora_set *loras,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
@@ -1783,7 +1895,7 @@ h3_dit *h3_dit_load_conditioned(
                     use_int8_row_fc2,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
-                    progress, progress_opaque, error, error_size);
+                    loras, progress, progress_opaque, error, error_size);
 }
 
 static int enter_token_reduction(h3_dit *dit, char *error,
@@ -1910,6 +2022,20 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->use_slower_scalar_qkv_rms,
             dit->use_slower_uncached_int8_scales),
            "DiT int8 QKV projection/norm/RoPE");
+    } else if (weight->lora_qkv.count) {
+        /* SPEC 7bis.1: the wrapper's own two halves, spelled out, because the
+         * delta belongs between them and dit->qkv is the raw projection. The
+         * M5-only fused kernel is not touched: on this device the wrapper
+         * takes exactly this fallback anyway (h3_gpu.m:3805-3810). */
+        OP(h3_gpu_linear_bf16(dit->gpu, dit->qkv, dit->mod_attention,
+            weight->qkv, NULL, rows, HIDDEN, INNER * 3),
+           "DiT QKV projection");
+        if (!lora_branch(dit, &weight->lora_qkv, dit->qkv, dit->mod_attention,
+                         rows, HIDDEN, INNER * 3, error, error_size)) return 0;
+        OP(h3_gpu_grouped_qkv_rope_bf16(
+            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+            weight->q_norm, weight->k_norm, rope_cos, rope_sin, rows, HEADS,
+            HEAD_DIM, ROPE_HALF, 1e-5f), "DiT QKV norm/RoPE");
     } else {
         OP(h3_gpu_grouped_qkv_linear_rope_bf16(
             dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
@@ -1951,6 +2077,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
+        if (!lora_branch(dit, &weight->lora_out, dit->attention_output,
+                         dit->attention_heads, rows, INNER, HIDDEN,
+                         error, error_size)) return 0;
     }
     int fused_int8_mlp_input = dit->int8_mlp &&
         !dit->use_slower_unfused_int8_inputs &&
@@ -2007,10 +2136,14 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     } else {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1,
             NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
+        if (!lora_branch(dit, &weight->lora_fc1, dit->fc1, dit->mod_mlp, rows,
+                         HIDDEN, FFN * 2, error, error_size)) return 0;
         OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
            "DiT SwiGLU");
         OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
             weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
+        if (!lora_branch(dit, &weight->lora_fc2, mlp_output, dit->activated,
+                         rows, FFN, HIDDEN, error, error_size)) return 0;
     }
     if (fuse_next_attention) {
         h3_dit_block *next_weight = &dit->blocks[next_index];
@@ -2392,6 +2525,16 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     }
     if (submit) OP(h3_gpu_submit(dit->gpu), "submit DiT forward");
 #undef OP
+    /* Gate 2 of the G4 guardrail, here because this is the one function both
+     * samplers route an evaluation through: after the first one the footprint
+     * is at steady state by measurement (alloc=0.000GiB across the loop), so
+     * the reading is the run's, not a warm-up's. A zero ceiling is a DiT
+     * nobody armed. */
+    if (dit->memory_ceiling.ceiling && !dit->memory_gate_done) {
+        dit->memory_gate_done = 1;
+        if (!h3_memory_gate_steady_state(&dit->memory_ceiling, error,
+                                         error_size)) return 0;
+    }
     return 1;
 }
 
@@ -3021,6 +3164,8 @@ void h3_dit_free(h3_dit *dit) {
     free_tensor(&dit->final_norm);
     free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
     free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
+    free_tensor(&dit->lora_hidden);
+    free_tensor(&dit->lora_delta);
 #define FREE(field) free_tensor(&dit->field)
     if (dit->activation_aliases) {
         dit->attention_heads = NULL;

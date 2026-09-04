@@ -356,6 +356,63 @@ static int h3_append_tensor(h3_st_header *header, h3_st_tensor tensor,
     return 1;
 }
 
+/* Keep the string entries of __metadata__: a LoRA states its conversion
+ * signature there, and the report has to quote those values verbatim. */
+static int h3_parse_metadata(h3_json_cursor *cursor, h3_st_header *header) {
+    /* A __metadata__ that is not an object carries nothing to keep, and files
+     * in the wild write null there. Skip it the way this parser did before
+     * metadata was read at all, instead of failing the whole header. */
+    h3_json_ws(cursor);
+    if (cursor->at >= cursor->end || *cursor->at != '{') return h3_json_skip(cursor);
+    if (!h3_json_take(cursor, '{')) return 0;
+    h3_json_ws(cursor);
+    if (cursor->at < cursor->end && *cursor->at == '}') {
+        cursor->at++;
+        return 1;
+    }
+    for (;;) {
+        char *key = h3_json_string(cursor);
+        if (!key || !h3_json_take(cursor, ':')) {
+            free(key);
+            return 0;
+        }
+        h3_json_ws(cursor);
+        if (cursor->at < cursor->end && *cursor->at == '"') {
+            char *value = h3_json_string(cursor);
+            if (!value) {
+                free(key);
+                return 0;
+            }
+            h3_st_meta *entries = realloc(
+                header->metadata,
+                (header->metadata_count + 1) * sizeof(*entries));
+            if (!entries) {
+                free(key);
+                free(value);
+                return h3_json_fail(cursor, "out of memory reading metadata");
+            }
+            header->metadata = entries;
+            entries[header->metadata_count].key = key;
+            entries[header->metadata_count].value = value;
+            header->metadata_count++;
+        } else {
+            free(key);
+            if (!h3_json_skip(cursor)) return 0;
+        }
+        h3_json_ws(cursor);
+        if (cursor->at >= cursor->end) {
+            return h3_json_fail(cursor, "unterminated metadata object");
+        }
+        if (*cursor->at == '}') {
+            cursor->at++;
+            return 1;
+        }
+        if (*cursor->at++ != ',') {
+            return h3_json_fail(cursor, "expected metadata comma");
+        }
+    }
+}
+
 static uint64_t h3_u64_le(const unsigned char bytes[8]) {
     uint64_t value = 0;
     for (unsigned index = 0; index < 8; index++) {
@@ -419,7 +476,7 @@ int h3_st_read_header(const char *path, h3_st_header *header,
         }
         if (!strcmp(name, "__metadata__")) {
             free(name);
-            if (!h3_json_skip(&cursor)) goto fail;
+            if (!h3_parse_metadata(&cursor, header)) goto fail;
         } else {
             h3_st_tensor tensor;
             memset(&tensor, 0, sizeof(tensor));
@@ -465,6 +522,11 @@ void h3_st_free_header(h3_st_header *header) {
         free(header->tensors[index].name);
     }
     free(header->tensors);
+    for (size_t index = 0; index < header->metadata_count; index++) {
+        free(header->metadata[index].key);
+        free(header->metadata[index].value);
+    }
+    free(header->metadata);
     free(header->path);
     memset(header, 0, sizeof(*header));
 }
@@ -473,6 +535,16 @@ const h3_st_tensor *h3_st_find(const h3_st_header *header, const char *name) {
     if (!header || !name) return NULL;
     for (size_t index = 0; index < header->tensor_count; index++) {
         if (!strcmp(header->tensors[index].name, name)) return &header->tensors[index];
+    }
+    return NULL;
+}
+
+const char *h3_st_metadata(const h3_st_header *header, const char *key) {
+    if (!header || !key) return NULL;
+    for (size_t index = 0; index < header->metadata_count; index++) {
+        if (!strcmp(header->metadata[index].key, key)) {
+            return header->metadata[index].value;
+        }
     }
     return NULL;
 }

@@ -34,17 +34,26 @@ typedef struct {
 } h3_st_tensor;
 
 typedef struct {
+    char *key;
+    char *value;
+} h3_st_meta;
+
+typedef struct {
     char *path;
     uint64_t file_size;
     uint64_t header_size;
     h3_st_tensor *tensors;
     size_t tensor_count;
+    /* String entries of __metadata__, in header order. */
+    h3_st_meta *metadata;
+    size_t metadata_count;
 } h3_st_header;
 
 int h3_st_read_header(const char *path, h3_st_header *header,
                       char *error, size_t error_size);
 void h3_st_free_header(h3_st_header *header);
 const h3_st_tensor *h3_st_find(const h3_st_header *header, const char *name);
+const char *h3_st_metadata(const h3_st_header *header, const char *key);
 uint64_t h3_st_tensor_elements(const h3_st_tensor *tensor);
 int h3_st_read_data(const h3_st_header *header, const h3_st_tensor *tensor,
                     void *data, size_t bytes, char *error, size_t error_size);

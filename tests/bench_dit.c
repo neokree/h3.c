@@ -1641,7 +1641,8 @@ int main(int argc, char **argv) {
             use_slower_grouped_quantizer, use_int8_row_fc2,
             video_condition,
             video_condition_elements, audio_condition,
-            audio_condition_elements, NULL, NULL, error, sizeof(error));
+            audio_condition_elements, NULL, NULL, NULL, error,
+            sizeof(error));
         free(video_condition);
         free(audio_condition);
     } else {
@@ -1650,7 +1651,7 @@ int main(int argc, char **argv) {
             active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
             all_bf16, all_bf16, all_bf16, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,
-            NULL, NULL, error,
+            NULL, NULL, NULL, error,
             sizeof(error));
     }
     if (!dit) die(error);

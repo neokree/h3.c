@@ -3,6 +3,7 @@
 
 #include "h3_gpu.h"
 #include "h3_host.h"
+#include "h3_lora.h"
 #include "h3_text_encoder.h"
 
 #include <stddef.h>
@@ -41,6 +42,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
+                         const h3_lora_set *loras,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
 
@@ -73,6 +75,7 @@ h3_dit *h3_dit_load_conditioned(
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
                          size_t condition_audio_elements,
+                         const h3_lora_set *loras,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
 void h3_dit_free(h3_dit *dit);
@@ -88,6 +91,12 @@ int h3_dit_reset_run(h3_dit *dit,
 
 size_t h3_dit_video_elements(const h3_dit *dit);
 size_t h3_dit_audio_elements(const h3_dit *dit);
+
+/* Arm gate 2 of the G4 guardrail with the ceiling taken before the load. It
+ * fires once, at the end of the first evaluation, and fails it: that is where
+ * the footprint is at steady state and where the caller's error buffer already
+ * reaches h3_last_error. */
+void h3_dit_arm_memory_gate(h3_dit *dit, const h3_memory_ceiling *ceiling);
 
 /* One raw data-ward velocity evaluation. Input/output video layout is
  * [24,T,H,W], audio is [32,2,T], all F32 on the host boundary. */
