@@ -811,37 +811,17 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
     return 1;
 }
 
-/* SPEC 7bis.4: the whole delta path, three dispatches on kernels that already
- * exist, once per adapter and strictly sequentially.
- *
- *     hidden = A*x      h3_gpu_linear_bf16
- *     delta  = B*hidden h3_gpu_linear_bf16
- *     y      = y + delta h3_gpu_add_bf16
- *
- * A already carries strength * alpha/rank, so nothing is scaled here. The
- * base weight is only ever read by the caller's own op: H1 and H2 hold because
- * this function never names a base tensor. An empty site dispatches nothing.
- */
+/* SPEC 7bis.4: the delta path, shared with the AdaLN precompute
+ * (h3_dit_schedule.c) through h3_lora_dispatch_branch. This wrapper only
+ * supplies this DiT's own scratch tensors and the "LoRA" label that keeps its
+ * dispatch failures distinguishable from the AdaLN ones. */
 static int lora_branch(h3_dit *dit, const h3_lora_site *site,
                        h3_gpu_tensor *y, const h3_gpu_tensor *x,
                        uint32_t rows, uint32_t input_dim, uint32_t output_dim,
                        char *error, size_t error_size) {
-    for (unsigned index = 0; index < site->count; index++) {
-        const h3_lora_branch *branch = &site->branches[index];
-        if (!gpu_op(dit, h3_gpu_linear_bf16(
-                dit->gpu, dit->lora_hidden, x, branch->a, NULL, rows,
-                input_dim, branch->rank), error, error_size,
-                "LoRA A projection") ||
-            !gpu_op(dit, h3_gpu_linear_bf16(
-                dit->gpu, dit->lora_delta, dit->lora_hidden, branch->b, NULL,
-                rows, branch->rank, output_dim), error, error_size,
-                "LoRA B projection") ||
-            !gpu_op(dit, h3_gpu_add_bf16(
-                dit->gpu, y, y, dit->lora_delta, rows * output_dim),
-                error, error_size, "LoRA delta"))
-            return 0;
-    }
-    return 1;
+    return h3_lora_dispatch_branch(dit->gpu, site, y, x, dit->lora_hidden,
+                                   dit->lora_delta, rows, input_dim,
+                                   output_dim, "LoRA", error, error_size);
 }
 
 static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,

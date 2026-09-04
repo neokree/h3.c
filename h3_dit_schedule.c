@@ -275,22 +275,10 @@ static int adaln_lora_dispatch(h3_gpu *gpu, const h3_lora_site *site,
                                h3_gpu_tensor *y, const h3_gpu_tensor *time,
                                uint32_t rows, uint32_t output_dim,
                                char *error, size_t error_size) {
-    int ok = 1;
-    for (unsigned index = 0; ok && index < site->count; index++) {
-        const h3_lora_branch *branch = &site->branches[index];
-        ok = gpu_op(gpu, h3_gpu_linear_bf16(
-                        gpu, scratch->hidden, time, branch->a, NULL, rows,
-                        H3_DIT_TIME_DIM, branch->rank),
-                    error, error_size, "AdaLN LoRA A projection") &&
-             gpu_op(gpu, h3_gpu_linear_bf16(
-                        gpu, scratch->delta, scratch->hidden, branch->b, NULL,
-                        rows, branch->rank, output_dim),
-                    error, error_size, "AdaLN LoRA B projection") &&
-             gpu_op(gpu, h3_gpu_add_bf16(gpu, y, y, scratch->delta,
-                                         rows * output_dim),
-                    error, error_size, "AdaLN LoRA delta");
-    }
-    return ok;
+    return h3_lora_dispatch_branch(gpu, site, y, time, scratch->hidden,
+                                   scratch->delta, rows, H3_DIT_TIME_DIM,
+                                   output_dim, "AdaLN LoRA", error,
+                                   error_size);
 }
 
 h3_dit_schedule *h3_dit_schedule_precompute(

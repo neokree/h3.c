@@ -1,6 +1,7 @@
 #include "h3_lora.h"
 
 #include "h3_internal.h"
+#include "h3_weights.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -19,17 +20,6 @@
 #define H3_LORA_PREFIX "diffusion_model."
 #define H3_LORA_WEIGHT_SUFFIX ".weight"
 
-/* SPEC 7.1: the four projections of a block plus the two AdaLN targets. A
- * name is a target only when it also exists in the checkpoint, so these five
- * suffixes cover blocks.N, token_refiner.blocks.N and final_layer alike. */
-static const char *const h3_lora_target_suffixes[] = {
-    "attn.qkv_proj.weight",
-    "attn.out_proj.weight",
-    "mlp.fc1.weight",
-    "mlp.fc2.weight",
-    "adaln_proj.linear.weight"
-};
-
 /* The pipeline LoRA applies to. Ref2VA is a separate DiT that this build has
  * no adapter corpus for; validating against FL2VA is what SPEC 7.1 measured.
  * ponytail: one pipeline, no selector until a Ref2VA LoRA exists. */
@@ -43,19 +33,6 @@ enum {
     H3_LORA_RANK_DISAGREE,
     H3_LORA_NOT_MATRIX
 };
-
-typedef struct {
-    char *name;      /* target name minus ".weight" */
-    uint64_t rows;
-    uint64_t cols;
-    int adaln;
-} h3_lora_target;
-
-typedef struct {
-    h3_lora_target *items;
-    size_t count;
-    size_t capacity;
-} h3_lora_targets;
 
 typedef struct {
     int status;
@@ -88,112 +65,6 @@ static int h3_lora_has_suffix(const char *value, const char *suffix) {
            !strcmp(value + length - suffix_length, suffix);
 }
 
-static const char *h3_lora_basename(const char *path) {
-    const char *slash = strrchr(path, '/');
-    return slash ? slash + 1 : path;
-}
-
-/* ---- target index: shard headers only, no weight bytes ---- */
-
-static int h3_lora_target_append(h3_lora_targets *targets,
-                                 const h3_st_tensor *tensor) {
-    size_t length = strlen(tensor->name) - strlen(H3_LORA_WEIGHT_SUFFIX);
-    if (targets->count == targets->capacity) {
-        size_t next = targets->capacity ? targets->capacity * 2 : 128;
-        h3_lora_target *items = realloc(targets->items,
-                                        next * sizeof(*items));
-        if (!items) return 0;
-        targets->items = items;
-        targets->capacity = next;
-    }
-    char *name = malloc(length + 1);
-    if (!name) return 0;
-    memcpy(name, tensor->name, length);
-    name[length] = '\0';
-    h3_lora_target *target = &targets->items[targets->count++];
-    target->name = name;
-    target->rows = tensor->shape[0];
-    target->cols = tensor->shape[1];
-    target->adaln = h3_lora_has_suffix(tensor->name,
-                                       "adaln_proj.linear.weight");
-    return 1;
-}
-
-static int h3_lora_is_target(const char *name) {
-    size_t count = sizeof(h3_lora_target_suffixes) /
-                   sizeof(*h3_lora_target_suffixes);
-    for (size_t index = 0; index < count; index++) {
-        if (h3_lora_has_suffix(name, h3_lora_target_suffixes[index])) return 1;
-    }
-    return 0;
-}
-
-static void h3_lora_targets_free(h3_lora_targets *targets) {
-    for (size_t index = 0; index < targets->count; index++) {
-        free(targets->items[index].name);
-    }
-    free(targets->items);
-    memset(targets, 0, sizeof(*targets));
-}
-
-static int h3_lora_targets_build(const char *directory,
-                                 h3_lora_targets *targets,
-                                 char *error, size_t error_size) {
-    memset(targets, 0, sizeof(*targets));
-    DIR *stream = opendir(directory);
-    if (!stream) {
-        snprintf(error, error_size, "%s: cannot read the transformer shards",
-                 directory);
-        return 0;
-    }
-    struct dirent *entry;
-    int ok = 1;
-    while (ok && (entry = readdir(stream)) != NULL) {
-        if (entry->d_name[0] == '.' ||
-            !h3_lora_has_suffix(entry->d_name, ".safetensors")) continue;
-        size_t size = strlen(directory) + strlen(entry->d_name) + 2;
-        char *path = malloc(size);
-        if (!path) {
-            snprintf(error, error_size, "out of memory indexing targets");
-            ok = 0;
-            break;
-        }
-        snprintf(path, size, "%s/%s", directory, entry->d_name);
-        h3_st_header header;
-        ok = h3_st_read_header(path, &header, error, error_size);
-        free(path);
-        if (!ok) break;
-        for (size_t index = 0; index < header.tensor_count; index++) {
-            const h3_st_tensor *tensor = &header.tensors[index];
-            if (tensor->ndim != 2 || !h3_lora_is_target(tensor->name)) continue;
-            if (!h3_lora_target_append(targets, tensor)) {
-                snprintf(error, error_size, "out of memory indexing targets");
-                ok = 0;
-                break;
-            }
-        }
-        h3_st_free_header(&header);
-    }
-    closedir(stream);
-    if (ok && !targets->count) {
-        snprintf(error, error_size, "%s: no adaptable weights in the shards",
-                 directory);
-        ok = 0;
-    }
-    if (!ok) h3_lora_targets_free(targets);
-    return ok;
-}
-
-static const h3_lora_target *h3_lora_target_find(
-        const h3_lora_targets *targets, const char *name) {
-    for (size_t index = 0; index < targets->count; index++) {
-        if (!strcmp(targets->items[index].name, name)) {
-            return &targets->items[index];
-        }
-    }
-    return NULL;
-}
-
 /* ---- pair assembly ---- */
 
 static char *h3_lora_pair_name(const char *key, const char *suffix) {
@@ -223,38 +94,16 @@ static char *h3_lora_sibling_key(const char *key, const char *suffix,
     return sibling;
 }
 
-static float h3_lora_half_to_float(uint16_t bits) {
-    uint32_t sign = (uint32_t)(bits & 0x8000u) << 16;
-    uint32_t exponent = (uint32_t)((bits >> 10) & 0x1fu);
-    uint32_t mantissa = (uint32_t)(bits & 0x3ffu);
-    uint32_t out;
-    if (!exponent) {
-        if (!mantissa) {
-            out = sign;
-        } else {
-            exponent = 127u - 15u + 1u;
-            while (!(mantissa & 0x400u)) {
-                mantissa <<= 1;
-                exponent--;
-            }
-            mantissa &= 0x3ffu;
-            out = sign | (exponent << 23) | (mantissa << 13);
-        }
-    } else if (exponent == 31u) {
-        out = sign | 0x7f800000u | (mantissa << 13);
-    } else {
-        out = sign | ((exponent + 127u - 15u) << 23) | (mantissa << 13);
-    }
-    float value;
-    memcpy(&value, &out, sizeof(value));
-    return value;
-}
-
 /* Read the scalar .alpha of one pair. It is a handful of bytes, not a weight:
  * H6 requires the file's own scale, and only the file has it. *found reports
  * the sibling tensor when there is one, so the caller can tell "no .alpha"
  * (scale 1.0 by definition) from "an .alpha h3 cannot read" (H6 violated in
- * silence otherwise). */
+ * silence otherwise).
+ *
+ * F32 and BF16 are the two dtypes the corpus actually writes for .alpha (no
+ * file carries one at all; a trainer that does writes one of these two); any
+ * other dtype falls to the default case below, which reports the tensor
+ * through *found and warns instead of guessing. */
 static int h3_lora_read_alpha(const h3_st_header *header, const char *key,
                               double *alpha, const h3_st_tensor **found) {
     char *alpha_key = h3_lora_sibling_key(key, H3_LORA_A_SUFFIX,
@@ -276,36 +125,12 @@ static int h3_lora_read_alpha(const h3_st_header *header, const char *key,
             *alpha = (double)value;
             return 1;
         }
-        case H3_DTYPE_F64: {
-            double value;
-            memcpy(&value, bytes, sizeof(value));
-            *alpha = value;
-            return 1;
-        }
         case H3_DTYPE_BF16: {
             uint16_t half;
             memcpy(&half, bytes, sizeof(half));
             uint32_t widened = (uint32_t)half << 16;
             float value;
             memcpy(&value, &widened, sizeof(value));
-            *alpha = (double)value;
-            return 1;
-        }
-        case H3_DTYPE_F16: {
-            uint16_t half;
-            memcpy(&half, bytes, sizeof(half));
-            *alpha = (double)h3_lora_half_to_float(half);
-            return 1;
-        }
-        case H3_DTYPE_I32: {
-            int32_t value;
-            memcpy(&value, bytes, sizeof(value));
-            *alpha = (double)value;
-            return 1;
-        }
-        case H3_DTYPE_I64: {
-            int64_t value;
-            memcpy(&value, bytes, sizeof(value));
             *alpha = (double)value;
             return 1;
         }
@@ -400,9 +225,13 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
         return NULL;
     }
 
-    h3_lora_targets targets;
-    if (!h3_lora_targets_build(transformer_dir, &targets, detail,
-                               sizeof(detail))) {
+    /* Shard headers only, no weight bytes (SPEC 6ter.3): h3_weight_store_open
+     * already opens every safetensors header in the directory, which is the
+     * same property the target index used to build for itself. Its error text
+     * is already in `detail` on failure, so it is propagated as-is. */
+    h3_weight_store *store = h3_weight_store_open(transformer_dir, detail,
+                                                   sizeof(detail));
+    if (!store) {
         snprintf(summary, summary_size, "%s", detail);
         h3_st_free_header(&header);
         return NULL;
@@ -431,7 +260,7 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
     if (capacity && (!pairs || !checks)) {
         free(pairs);
         free(checks);
-        h3_lora_targets_free(&targets);
+        h3_weight_store_free(store);
         h3_st_free_header(&header);
         snprintf(summary, summary_size, "%s: out of memory reading pairs",
                  path);
@@ -479,21 +308,28 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
             incoherent++;
             continue;
         }
-        const h3_lora_target *target = h3_lora_target_find(&targets,
-                                                           pair->name);
-        if (!target) {
+        char target_name[256];
+        snprintf(target_name, sizeof(target_name), "%s%s", pair->name,
+                 H3_LORA_WEIGHT_SUFFIX);
+        const h3_st_tensor *target = h3_weight_find(store, target_name, NULL);
+        /* A tensor that resolves but is not a matrix is unapplicable exactly
+         * like a name with no match at all, not a crash: nothing below reads
+         * shape[1] on anything but a 2D tensor. */
+        if (!target || target->ndim != 2) {
             check->status = H3_LORA_NO_TARGET;
             no_target++;
             continue;
         }
-        check->rows = target->rows;
-        check->cols = target->cols;
-        if (target->rows != pair->out_dim || target->cols != pair->in_dim) {
+        check->rows = target->shape[0];
+        check->cols = target->shape[1];
+        if (target->shape[0] != pair->out_dim ||
+            target->shape[1] != pair->in_dim) {
             check->status = H3_LORA_SHAPE_MISMATCH;
             shape_mismatch++;
             continue;
         }
-        pair->adaln = target->adaln;
+        pair->adaln = h3_lora_has_suffix(target->name,
+                                         "adaln_proj.linear.weight");
         if (pair->adaln) adaln_pairs++;
         double alpha = 0.0;
         const h3_st_tensor *alpha_tensor = NULL;
@@ -616,13 +452,13 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
     adapter->resident_bytes = resident;
     adapter->size = header.file_size;
     free(checks);
-    h3_lora_targets_free(&targets);
+    h3_weight_store_free(store);
     return adapter;
 
 failed:
     h3_lora_free_pairs(pairs, pair_count);
     free(checks);
-    h3_lora_targets_free(&targets);
+    h3_weight_store_free(store);
     h3_st_free_header(&header);
     return NULL;
 }
@@ -866,8 +702,9 @@ int h3_lora_set_build(h3_ctx *ctx, const h3_params *params,
             goto failed;
         }
         if (!isfinite(request->strength)) {
+            const char *slash = strrchr(request->path, '/');
             h3_set_error(ctx, "lora: strength for %s is not a finite number",
-                         h3_lora_basename(request->path));
+                         slash ? slash + 1 : request->path);
             goto failed;
         }
         const h3_lora_adapter *adapter = h3_lora_acquire(
@@ -1027,6 +864,52 @@ void h3_lora_site_free(h3_lora_site *site) {
     }
     free(site->branches);
     memset(site, 0, sizeof(*site));
+}
+
+/* SPEC 7bis.4: the whole delta path, three dispatches on kernels that already
+ * exist, once per branch and strictly sequentially. Shared by the per-step
+ * block projections (h3_dit.c, label "LoRA") and the one-shot AdaLN precompute
+ * (h3_dit_schedule.c, label "AdaLN LoRA"), which differ only in which scratch
+ * tensors they reach for and which of those two labels names the failing
+ * dispatch:
+ *
+ *     hidden = A*x       h3_gpu_linear_bf16
+ *     delta  = B*hidden  h3_gpu_linear_bf16
+ *     y      = y + delta h3_gpu_add_bf16
+ *
+ * A already carries strength * alpha/rank, so nothing is scaled here. The
+ * base weight is only ever read by the caller's own op: H1 and H2 hold because
+ * this function never names a base tensor. An empty site dispatches nothing. */
+int h3_lora_dispatch_branch(h3_gpu *gpu, const h3_lora_site *site,
+                            h3_gpu_tensor *y, const h3_gpu_tensor *x,
+                            h3_gpu_tensor *hidden, h3_gpu_tensor *delta,
+                            uint32_t rows, uint32_t input_dim,
+                            uint32_t output_dim, const char *label,
+                            char *error, size_t error_size) {
+    for (unsigned index = 0; index < site->count; index++) {
+        const h3_lora_branch *branch = &site->branches[index];
+        if (!h3_gpu_linear_bf16(gpu, hidden, x, branch->a, NULL, rows,
+                                input_dim, branch->rank)) {
+            if (error && error_size)
+                snprintf(error, error_size, "%s A projection: %s", label,
+                         h3_gpu_error(gpu));
+            return 0;
+        }
+        if (!h3_gpu_linear_bf16(gpu, delta, hidden, branch->b, NULL, rows,
+                                branch->rank, output_dim)) {
+            if (error && error_size)
+                snprintf(error, error_size, "%s B projection: %s", label,
+                         h3_gpu_error(gpu));
+            return 0;
+        }
+        if (!h3_gpu_add_bf16(gpu, y, y, delta, rows * output_dim)) {
+            if (error && error_size)
+                snprintf(error, error_size, "%s delta: %s", label,
+                         h3_gpu_error(gpu));
+            return 0;
+        }
+    }
+    return 1;
 }
 
 /* ---- the G4 memory guardrail (SPEC 10, G4) ----

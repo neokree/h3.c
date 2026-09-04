@@ -110,6 +110,18 @@ int h3_lora_site_build(const h3_lora_set *set, h3_gpu *gpu, const char *name,
                        h3_lora_site *site, char *error, size_t error_size);
 void h3_lora_site_free(h3_lora_site *site);
 
+/* The three-dispatch delta branch of SPEC 7bis.4, shared by the per-step
+ * block projections and the one-shot AdaLN precompute. `hidden` and `delta`
+ * are the caller's own scratch tensors (sized differently by each caller);
+ * `label` ("LoRA" or "AdaLN LoRA") keeps the two call sites' error strings
+ * distinguishable. */
+int h3_lora_dispatch_branch(h3_gpu *gpu, const h3_lora_site *site,
+                            h3_gpu_tensor *y, const h3_gpu_tensor *x,
+                            h3_gpu_tensor *hidden, h3_gpu_tensor *delta,
+                            uint32_t rows, uint32_t input_dim,
+                            uint32_t output_dim, const char *label,
+                            char *error, size_t error_size);
+
 /* Build the active set for one generation: order preserved, never sorted,
  * strength-0 entries validated and then dropped so the dispatch loop with no
  * LoRA stays identical by construction (H4). */
