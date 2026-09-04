@@ -234,10 +234,69 @@ cleanup:
     return result;
 }
 
+/* The delta branch for the two AdaLN targets. Same three dispatches as the
+ * four per-step projections (SPEC 7bis.4), on the same shared intermediate,
+ * except that here the "rows" are timestep rows and the whole thing runs once
+ * at load: both tensors below are gone before the denoiser starts. One delta
+ * buffer covers both targets, because FINAL_OUTPUT < BLOCK_OUTPUT. */
+typedef struct {
+    h3_gpu_tensor *hidden;
+    h3_gpu_tensor *delta;
+} adaln_lora_scratch;
+
+static void free_adaln_scratch(adaln_lora_scratch *scratch) {
+    free_tensor(&scratch->hidden);
+    free_tensor(&scratch->delta);
+}
+
+static uint64_t adaln_lora_rank(const h3_lora_set *loras) {
+    uint64_t rank = 0;
+    if (!loras) return 0;
+    for (size_t index = 0; index < loras->count; index++) {
+        const h3_lora_adapter *adapter = loras->entries[index].adapter;
+        for (size_t which = 0; which < adapter->pair_count; which++) {
+            const h3_lora_pair *pair = &adapter->pairs[which];
+            /* Read per pair, never per file: upstream is rank 16 here and 64
+             * on the backbone (SPEC 7.2). */
+            if (pair->adaln && pair->rank > rank) rank = pair->rank;
+        }
+    }
+    return rank;
+}
+
+/* Encodes every branch of `site` onto `y`, which already holds the base
+ * projection. The base weight is only read by the caller's own op, so H1 and
+ * H2 hold: nothing here names a checkpoint tensor. Runs inside the caller's
+ * h3_gpu_begin/h3_gpu_submit pair, which is also why the site is the caller's
+ * to build and to free: releasing a branch marks its buffers purgeable, so it
+ * has to outlive the submit that reads them. */
+static int adaln_lora_dispatch(h3_gpu *gpu, const h3_lora_site *site,
+                               const adaln_lora_scratch *scratch,
+                               h3_gpu_tensor *y, const h3_gpu_tensor *time,
+                               uint32_t rows, uint32_t output_dim,
+                               char *error, size_t error_size) {
+    int ok = 1;
+    for (unsigned index = 0; ok && index < site->count; index++) {
+        const h3_lora_branch *branch = &site->branches[index];
+        ok = gpu_op(gpu, h3_gpu_linear_bf16(
+                        gpu, scratch->hidden, time, branch->a, NULL, rows,
+                        H3_DIT_TIME_DIM, branch->rank),
+                    error, error_size, "AdaLN LoRA A projection") &&
+             gpu_op(gpu, h3_gpu_linear_bf16(
+                        gpu, scratch->delta, scratch->hidden, branch->b, NULL,
+                        rows, branch->rank, output_dim),
+                    error, error_size, "AdaLN LoRA B projection") &&
+             gpu_op(gpu, h3_gpu_add_bf16(gpu, y, y, scratch->delta,
+                                         rows * output_dim),
+                    error, error_size, "AdaLN LoRA delta");
+    }
+    return ok;
+}
+
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
-    int audio_condition,
+    int audio_condition, const h3_lora_set *loras,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
@@ -252,6 +311,7 @@ h3_dit_schedule *h3_dit_schedule_precompute(
         return NULL;
     }
     schedule->gpu = gpu;
+    adaln_lora_scratch scratch = {NULL, NULL};
     float *features = NULL;
     if (!prepare_rows(schedule, sigmas, visual_condition, audio_condition,
                       &features, error, error_size)) goto failed;
@@ -260,6 +320,21 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     free(features);
     features = NULL;
     if (!time) goto failed;
+
+    uint64_t lora_rank = adaln_lora_rank(loras);
+    if (lora_rank) {
+        scratch.hidden = h3_gpu_tensor_new_bf16(
+            gpu, (size_t)schedule->time_rows * lora_rank);
+        scratch.delta = h3_gpu_tensor_new_bf16(
+            gpu, (size_t)schedule->time_rows * BLOCK_OUTPUT);
+        if (!scratch.hidden || !scratch.delta) {
+            fail(error, error_size,
+                 "cannot allocate the AdaLN LoRA branch scratch: %s",
+                 h3_gpu_error(gpu));
+            h3_gpu_tensor_free(time);
+            goto failed;
+        }
+    }
 
     for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
         char weight_name[128], bias_name[128], operation[128];
@@ -284,12 +359,22 @@ h3_dit_schedule *h3_dit_schedule_precompute(
             goto failed;
         }
         snprintf(operation, sizeof(operation), "AdaLN block %u", block);
-        int ok = gpu_op(gpu, h3_gpu_begin(gpu), error, error_size, operation) &&
+        char pair_name[128];
+        snprintf(pair_name, sizeof(pair_name), "blocks.%u.adaln_proj.linear",
+                 block);
+        h3_lora_site site;
+        int ok = h3_lora_site_build(loras, gpu, pair_name, &site,
+                                    error, error_size) &&
+            gpu_op(gpu, h3_gpu_begin(gpu), error, error_size, operation) &&
             gpu_op(gpu, h3_gpu_linear_bf16(
                 gpu, schedule->blocks[block], time, weight, bias,
                 schedule->time_rows, H3_DIT_TIME_DIM, BLOCK_OUTPUT),
                 error, error_size, operation) &&
+            adaln_lora_dispatch(gpu, &site, &scratch,
+                schedule->blocks[block], time, schedule->time_rows,
+                BLOCK_OUTPUT, error, error_size) &&
             gpu_op(gpu, h3_gpu_submit(gpu), error, error_size, operation);
+        h3_lora_site_free(&site);
         free_tensor(&weight);
         free_tensor(&bias);
         if (!ok) {
@@ -308,15 +393,27 @@ h3_dit_schedule *h3_dit_schedule_precompute(
         FINAL_OUTPUT, error, error_size);
     schedule->final = h3_gpu_tensor_new_bf16(
         gpu, (size_t)schedule->time_rows * FINAL_OUTPUT);
-    if (!final_w || !final_b || !schedule->final ||
-        !gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
-                "begin final AdaLN") ||
-        !gpu_op(gpu, h3_gpu_linear_bf16(
+    /* One pair, not one per block: final_layer is the 51st AdaLN target
+     * (SPEC 7.1). */
+    /* Zeroed up front: the short-circuit below can skip the build, and the
+     * free runs either way. */
+    h3_lora_site final_site = {NULL, 0};
+    int final_ok = final_w && final_b && schedule->final &&
+        h3_lora_site_build(loras, gpu, "final_layer.adaln_proj.linear",
+                           &final_site, error, error_size) &&
+        gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
+               "begin final AdaLN") &&
+        gpu_op(gpu, h3_gpu_linear_bf16(
             gpu, schedule->final, time, final_w, final_b, schedule->time_rows,
             H3_DIT_TIME_DIM, FINAL_OUTPUT), error, error_size,
-            "final AdaLN projection") ||
-        !gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
-                "submit final AdaLN")) {
+            "final AdaLN projection") &&
+        adaln_lora_dispatch(gpu, &final_site, &scratch, schedule->final, time,
+                            schedule->time_rows, FINAL_OUTPUT,
+                            error, error_size) &&
+        gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
+               "submit final AdaLN");
+    h3_lora_site_free(&final_site);
+    if (!final_ok) {
         if ((!error || !*error) && (!final_w || !final_b || !schedule->final))
             fail(error, error_size, "cannot allocate final AdaLN tensors: %s",
                  h3_gpu_error(gpu));
@@ -327,11 +424,13 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     }
     free_tensor(&final_w);
     free_tensor(&final_b);
+    free_adaln_scratch(&scratch);
     h3_gpu_tensor_free(time);
     return schedule;
 
 failed:
     free(features);
+    free_adaln_scratch(&scratch);
     h3_dit_schedule_free(schedule);
     return NULL;
 }

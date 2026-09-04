@@ -3,6 +3,7 @@
 
 #include "h3_gpu.h"
 #include "h3_host.h"
+#include "h3_lora.h"
 #include "h3_weights.h"
 
 #include <stddef.h>
@@ -21,11 +22,17 @@ typedef void (*h3_dit_schedule_progress)(int completed_blocks,
 
 /* Materialize every per-step AdaLN value. This intentionally submits one
  * projection at a time, so a 498 MiB block projection is released before the
- * next is loaded. */
+ * next is loaded.
+ *
+ * `loras` may be NULL. When it carries AdaLN pairs the delta branch of SPEC
+ * 7bis.4 runs on this precompute's own output, once per target: the AdaLN
+ * weights are a one-shot precompute, not a per-step projection (SPEC 7bis.3),
+ * and a change of active set redoes the whole thing through the prepared-DiT
+ * cache key (SPEC 7bis.5), so there is no dedicated recompute path. */
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
-    int audio_condition,
+    int audio_condition, const h3_lora_set *loras,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size);
 void h3_dit_schedule_free(h3_dit_schedule *schedule);

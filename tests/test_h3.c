@@ -1,5 +1,6 @@
 #include "h3_host.h"
 #include "h3_dit.h"
+#include "h3_lora.h"
 #include "h3_metal.h"
 #include "h3_safetensors.h"
 #include "h3_terminal.h"
@@ -396,6 +397,71 @@ static void test_terminal_zoom(void) {
     CHECK(!h3_terminal_display_dimensions(INT32_MAX, 1, &width, &height));
 }
 
+/* The two G4 stop strings are contract (SPEC 5bis.5): each names which of the
+ * two min() terms bit, by the physical thing and never by a gate number. */
+static void test_memory_guardrail(void) {
+    char error[512];
+    h3_memory_ceiling ceiling;
+    memset(&ceiling, 0, sizeof(ceiling));
+    ceiling.working_set = UINT64_C(36) << 30;
+    ceiling.ceiling = UINT64_C(32) << 30;
+
+    /* Empty active set, and the gates still run: the guardrail is on the whole
+     * process, so 9.55 GiB of tiled decoder fits under a 32 GiB ceiling. */
+    h3_lora_set empty = {NULL, 0};
+    CHECK(h3_memory_gate_preflight(&ceiling, &empty, 0, error, sizeof(error)));
+    CHECK(h3_memory_gate_preflight(&ceiling, &empty, 1, error, sizeof(error)));
+
+    /* 34.1 GiB needed: 9.55 GiB of decoder plus one implausible adapter. */
+    h3_lora_adapter adapter;
+    memset(&adapter, 0, sizeof(adapter));
+    adapter.resident_bytes = (uint64_t)(34.1 * 1073741824.0) -
+                             UINT64_C(10254484275);
+    h3_lora_entry entry = {&adapter, 1.0f};
+    h3_lora_set set = {&entry, 1};
+    CHECK(!h3_memory_gate_preflight(&ceiling, &set, 0, error, sizeof(error)));
+    CHECK(!strcmp(error,
+        "not enough memory for this run: 34.1 GiB needed, 32.0 GiB available\n"
+        "    (Metal working set 36.0 GiB minus the 4 GiB reserve).\n"
+        "    Lower the canvas or drop an adapter."));
+
+    ceiling.system_free = (uint64_t)(24.9 * 1073741824.0);
+    ceiling.footprint = (uint64_t)(2.5 * 1073741824.0);
+    ceiling.ceiling = ceiling.system_free + ceiling.footprint;
+    ceiling.system_free_bit = 1;
+    CHECK(!h3_memory_gate_preflight(&ceiling, &set, 0, error, sizeof(error)));
+    CHECK(!strcmp(error,
+        "not enough memory for this run: 34.1 GiB needed, 27.4 GiB available\n"
+        "    (system free 24.9 GiB plus our 2.5 GiB).\n"
+        "    Another process is holding memory: quit it, or lower the canvas."));
+
+    /* Gate 2 samples our own phys_footprint, so only the ceiling is fabricated
+     * here: one byte is under anything this process can weigh. */
+    ceiling.ceiling = 1;
+    CHECK(!h3_memory_gate_steady_state(&ceiling, error, sizeof(error)));
+    CHECK(!strncmp(error, "memory ceiling hit after the first denoiser "
+                          "evaluation:\n    footprint ", 60));
+    CHECK(strstr(error, "(system free 24.9 GiB plus our 2.5 GiB).\n"
+                        "    Another process is holding memory: quit it, or "
+                        "lower the canvas."));
+    ceiling.system_free_bit = 0;
+    CHECK(!h3_memory_gate_steady_state(&ceiling, error, sizeof(error)));
+    CHECK(strstr(error, "(Metal working set 36.0 GiB minus the 4 GiB "
+                        "reserve).\n    Lower the canvas or drop an adapter."));
+    CHECK(!strstr(error, "gate"));
+
+    /* The 4 GiB reserve, and the min() that picks the term the message names. */
+    h3_memory_ceiling taken;
+    h3_memory_ceiling_take(UINT64_C(36) << 30, &taken);
+    CHECK(taken.working_set == UINT64_C(36) << 30);
+    CHECK(taken.ceiling <= (UINT64_C(32) << 30));
+    CHECK(taken.system_free_bit ==
+          (taken.system_free + taken.footprint < (UINT64_C(32) << 30)));
+    CHECK(taken.ceiling == (taken.system_free_bit
+                            ? taken.system_free + taken.footprint
+                            : (UINT64_C(32) << 30)));
+}
+
 int main(void) {
     test_temporal_and_canvas();
     test_schedule();
@@ -409,6 +475,7 @@ int main(void) {
     test_dit_row_conversions();
     test_metal_probe();
     test_terminal_zoom();
+    test_memory_guardrail();
     printf("ok: %d checks\n", tests_run);
     return 0;
 }

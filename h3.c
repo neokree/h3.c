@@ -3,6 +3,7 @@
 #include "h3_host.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
+#include "h3_lora.h"
 #include "h3_metal.h"
 #include "h3_multimodal.h"
 #include "h3_safetensors.h"
@@ -163,7 +164,8 @@ failed:
 
 static char *h3_prepared_key(const char *conditioning,
                              const h3_params *params,
-                             int render_width, int render_height) {
+                             int render_width, int render_height,
+                             const h3_lora_set *loras) {
     h3_key key = {0};
     if (!h3_key_append(
             &key,
@@ -187,6 +189,17 @@ static char *h3_prepared_key(const char *conditioning,
             params->use_slower_grouped_quantizer)) {
         free(key.text);
         return NULL;
+    }
+    /* The active set is part of the prepared-DiT identity: a different key
+     * frees and reloads it, which is what redoes refine_text and the AdaLN
+     * precompute. Order is significant and never sorted (SPEC 7bis.5). */
+    for (size_t index = 0; index < loras->count; index++) {
+        if (!h3_key_file(&key, "lora", loras->entries[index].adapter->path) ||
+            !h3_key_append(&key, "|strength=%.9g",
+                           (double)loras->entries[index].strength)) {
+            free(key.text);
+            return NULL;
+        }
     }
     return key.text;
 }
@@ -462,6 +475,7 @@ h3_ctx *h3_load_dir(const char *model_dir) {
 void h3_free(h3_ctx *ctx) {
     if (!ctx) return;
     h3_cache_clear(ctx);
+    h3_lora_release_all(ctx);
     free(ctx->model_dir);
     free(ctx);
 }
@@ -911,6 +925,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     memset(&waveform, 0, sizeof(waveform));
     uint8_t *rgb8 = NULL;
     h3_result *result = NULL;
+    h3_lora_set loras;
+    memset(&loras, 0, sizeof(loras));
+    h3_memory_ceiling ceiling;
+    memset(&ceiling, 0, sizeof(ceiling));
     char *conditioning_key = NULL;
     char *prepared_key = NULL;
     char *decoder_key = NULL;
@@ -933,6 +951,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory resolving generation model paths");
         goto cleanup;
     }
+    /* Built fresh for this generation, before anything is loaded: a fatal
+     * LoRA stops the run instead of delivering a video without it. */
+    if (!h3_lora_set_build(ctx, params, &loras)) goto cleanup;
     conditioning_key = h3_conditioning_key(
         prompt, params, render_width, render_height, ref2va);
     if (!conditioning_key) {
@@ -940,7 +961,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     prepared_key = h3_prepared_key(
-        conditioning_key, params, render_width, render_height);
+        conditioning_key, params, render_width, render_height, &loras);
     if (!prepared_key) {
         h3_set_error(ctx, "out of memory constructing prepared-model cache key");
         goto cleanup;
@@ -969,6 +990,18 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
     char detail[512];
+    /* Gate 1 of the G4 guardrail: before a byte of the checkpoint is read, and
+     * always, empty active set included. Any surviving ctx->dit here is the
+     * cache hit for this generation, which keeps the weight slots resident
+     * across the decoder instead of serialising them, exactly as --preview
+     * does. The ceiling is taken once, and gate 2 compares against this one. */
+    h3_memory_ceiling_take(ctx->device.recommended_working_set, &ceiling);
+    if (!h3_memory_gate_preflight(&ceiling, &loras,
+                                  params->preview_denoise || ctx->dit != NULL,
+                                  detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
     if (conditioning_hit) {
         size_t cached_reference_count = 0;
         if (!h3_conditioning_cache_load(
@@ -1494,6 +1527,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->use_int8_row_fc2,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
+            &loras,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     } else {
         dit = h3_dit_load_t2va(
@@ -1513,12 +1547,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->use_slower_dynamic_fc1_k,
             params->use_slower_grouped_quantizer,
             params->use_int8_row_fc2,
+            &loras,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     }
     if (!dit) {
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }
+    h3_dit_arm_memory_gate(dit, &ceiling);
     if (ctx->cache_enabled && !dit_is_cached) {
         char *key_copy = strdup(prepared_key);
         if (!key_copy) {
@@ -1690,6 +1726,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     result->seed = params->seed;
 
 cleanup:
+    h3_lora_set_free(&loras);
     free(conditioning_key);
     free(prepared_key);
     free(decoder_key);
