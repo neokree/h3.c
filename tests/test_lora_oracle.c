@@ -1,4 +1,4 @@
-/* T1 oracle harness for runtime LoRA adapters (docs/SPEC.md section 8).
+/* T1 oracle harness for runtime LoRA adapters.
  *
  * The claim under test is H3: the runtime branch
  *
@@ -29,7 +29,7 @@
  *   bf16-out the same sum rounded back to BF16 for the next kernel
  * The tolerance is asserted on bf16-out, always the larger of the two and the
  * one the shipped h3_gpu_add_bf16 actually produces, together with the
- * significance guard on the delta's own weight (SPEC 8, T1).
+ * significance guard on the delta's own weight.
  *
  * T1b is this same run seen whole: all four projections of one block in one
  * pass, and a projection whose pair is missing is fatal rather than skipped.
@@ -39,8 +39,7 @@
  *
  * T5 is the same harness with a second LoRA path: two adapters are two
  * sequential branches over the same input, and the oracle fuses both deltas
- * into W. Passing the two real files of docs/SPEC.md 8bis (rank 64 and rank
- * 16) measures the composition of two ranks rather than one file twice.
+ * into W. Passing the two real corpus files (rank 64 and rank 16) measures the composition of two ranks rather than one file twice.
  *
  * usage: h3_lora_oracle_test [LORA] [MODEL_ROOT] [STRENGTH] [BLOCK] [LORA2]
  * STRENGTH defaults to the 100 that T1 is defined at: at strength 1 the delta
@@ -61,12 +60,12 @@
 
 enum { ROWS = 4, MAX_SOURCES = 2 };
 
-/* SPEC 8, T1. The tolerance applies to the bf16-out figure, always the larger
+/* The tolerance applies to the bf16-out figure, always the larger
  * of the two printed. The significance guard is the other half of the same
  * requirement: a delta too weak to move the output agrees with anything, so a
  * LoRA file swapped for a limp one has to fail instead of passing silently.
- * DEVIATION FROM SPEC 8, on record. The spec asks for "10x la tolleranza",
- * 3e-2, from a four-block sample. A sweep of all 50 blocks of the corpus turbo
+ * DEVIATION FROM THE ORIGINAL SPEC, on record. It asked for ten times the
+ * tolerance, 3e-2, from a four-block sample. A sweep of all 50 blocks of the corpus turbo
  * file contradicts it: the weakest deltas are blocks 29, 8 and 2 at 1.326e-02,
  * 1.401e-02 and 1.428e-02, all of which agree with the oracle at 2.35e-03. Both
  * 3e-2 and 1.5e-2 therefore fail a correct implementation. 1.0e-2 sits below the
@@ -76,10 +75,10 @@ static const double T1_TOLERANCE = 3e-3;
 static const double T1_MIN_DELTA_SHARE = 1.0e-2;
 
 /* Per-half amplitude of the synthetic AdaLN pair, on top of the 1/sqrt(fan-in)
- * that keeps the two GEMMs in scale. SPEC 8bis leaves the amplitude free ("una
- * coppia qualunque della forma giusta"), and this value puts the delta near the
- * 4,7% of the output that SPEC 7bis.4 measures on the real pairs at strength
- * 100. That regime is the premise of 7bis.4's argument that the fused-A
+ * that keeps the two GEMMs in scale. The corpus design leaves the amplitude
+ * free (any pair of the right shape), and this value puts the delta near the
+ * 4,7% of the output measured on the real pairs at strength 100
+ * (docs/lora.md). That regime is the premise of the argument that the fused-A
  * rounding is negligible; an arbitrary amplitude that drowns the base output in
  * delta would measure a case the design never costed. Measured here at
  * strength 100: delta share 4,08e-02, against 1,67e-02 to 4,96e-02 for the four
@@ -88,11 +87,11 @@ static const double T1_MIN_DELTA_SHARE = 1.0e-2;
 
 /* `synthetic_rank` is 0 for a target whose pair is read from the LoRA file.
  * The AdaLN target has no pair in either corpus file (the pruned converter
- * dropped all 51 of them), and docs/SPEC.md 8bis settles that the numbers do
+ * dropped all 51 of them), and the corpus design settles that the numbers do
  * not need the 780 MB upstream download: the oracle builds W + s*B@A from a
  * real W and a pair of the right shape, so the pair is synthesised here at the
- * shapes read from the upstream header, A[16, 2688] and B[96768, 16]
- * (docs/SPEC.md 7bis.3). The target itself is real, and it is the same
+ * shapes read from the upstream header, A[16, 2688] and B[96768, 16].
+ * The target itself is real, and it is the same
  * blocks.N.adaln_proj.linear.weight that h3_dit_schedule.c:267 loads. */
 static const struct {
     const char *name;
@@ -198,7 +197,7 @@ static uint16_t *synthetic_half(size_t count, size_t fan_in, uint64_t seed,
 }
 
 /* A bf16 copy of A with the scale already inside it, which is where the
- * shipped path puts it (SPEC 7bis.4, h3_lora.c h3_lora_branch_build). The
+ * shipped path puts it (h3_lora.c h3_lora_branch_build). The
  * oracle keeps the unscaled A in float32, so the extra rounding this
  * introduces is measured rather than cancelled. */
 static uint16_t *fuse_scale(const uint16_t *values, size_t count, float scale,
@@ -211,7 +210,7 @@ static uint16_t *fuse_scale(const uint16_t *values, size_t count, float scale,
 
 /* `scale` carries the file's own alpha/rank into the reference, which is where
  * the shipped materialisation puts it too (h3_lora.c h3_lora_branch_build,
- * SPEC 7bis.4, H6). It is 1.0 for both corpus files, which have no .alpha. */
+ * H6). It is 1.0 for both corpus files, which have no .alpha. */
 static float *expand_bf16(const uint16_t *values, size_t count, float scale,
                           const char *what) {
     float *expanded = checked_malloc(count * sizeof(*expanded), what);
@@ -221,7 +220,7 @@ static float *expand_bf16(const uint16_t *values, size_t count, float scale,
 }
 
 /* The parsed pair for one target name, or NULL. h3_lora_parse has already
- * stripped the optional diffusion_model. prefix (SPEC 7.2), so a pair name is
+ * stripped the optional diffusion_model. prefix, so a pair name is
  * its target minus ".weight" and a plain compare finds it. */
 static const h3_lora_pair *adapter_pair(const h3_lora_adapter *adapter,
                                         const char *name) {
@@ -236,7 +235,7 @@ static const h3_lora_pair *adapter_pair(const h3_lora_adapter *adapter,
  * Each `lora_a` arrives with the strength already fused into it, exactly as
  * the shipped materialisation hands it to h3_dit.c's lora_branch, so nothing
  * is scaled here either. Several adapters are several sequential branches
- * over the same input, never a concatenated A (SPEC 7bis.4): that is the
+ * over the same input, never a concatenated A: that is the
  * composition T5 asks about. base_out and rounded_out are optional. */
 static void run_branch(h3_gpu *gpu, const h3_gpu_tensor *weight,
                        h3_gpu_tensor *const *lora_a,
@@ -380,7 +379,7 @@ int main(int argc, char **argv) {
     /* The adapters and the active set are the shipped ones, not a local
      * re-read of the file: everything below materialises through
      * h3_lora_site_build, so what is measured is the branch h3_dit.c
-     * dispatches and not a copy of it living in this test (SPEC 8, T1b). */
+     * dispatches and not a copy of it living in this test. */
     h3_lora_adapter *adapters[MAX_SOURCES];
     h3_lora_entry entries[MAX_SOURCES], zero_entries[MAX_SOURCES];
     for (size_t source = 0; source < sources; source++) {
@@ -433,14 +432,14 @@ int main(int argc, char **argv) {
         /* T1b: the projections of a block are measured together or not at
          * all. Skipping one here is exactly the hole a per-tensor oracle
          * leaves - a projection that never gets its branch passes by not being
-         * looked at. The AdaLN target is the exception SPEC 8bis settles: no
+         * looked at. The AdaLN target is the exception the corpus design settles: no
          * corpus file carries its pair, so it is synthesised at the upstream
          * shapes and measured against the same real W. */
         int synthetic = missing == sources && PROJECTIONS[which].synthetic_rank;
         if (missing && !synthetic) {
             fprintf(stderr, "FAIL tests/test_lora_oracle.c: %s has no "
                     "pair for %s; a whole-block oracle needs all four "
-                    "projections in one pass (SPEC 8, T1b)\n",
+                    "projections in one pass\n",
                     lora_paths[first_missing], pair_name);
             exit(1);
         }
@@ -541,7 +540,7 @@ int main(int argc, char **argv) {
                                     error, sizeof(error))) die(error);
             if (site.count != sources || zero_site.count != sources)
                 die("h3_lora_site_build gave the target fewer branches than "
-                    "the active set has adapters (SPEC 8, T1b)");
+                    "the active set has adapters");
             for (size_t source = 0; source < sources; source++) {
                 lora_a[source] = site.branches[source].a;
                 lora_b[source] = site.branches[source].b;
@@ -593,7 +592,7 @@ int main(int argc, char **argv) {
             die("branch exceeds the T1 tolerance of 3e-3 on bf16-out");
         if (!(delta_share.rel_l2 >= T1_MIN_DELTA_SHARE))
             die("delta too weak to be significant: raise the strength or use "
-                "a stronger pair (SPEC 8, T1 significance guard)");
+                "a stronger pair (T1 significance guard)");
 
         /* H4 in miniature: with the strength fused to zero the branch must
          * return the base output unchanged, bit for bit, not merely close. */

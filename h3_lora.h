@@ -1,5 +1,5 @@
 /* Runtime LoRA adapters: parsing, target resolution and the active set.
- * Internal to the build; not part of the libh3.a contract (SPEC 6ter.2). */
+ * Internal to the build; not part of the libh3.a contract. */
 #ifndef H3_LORA_H
 #define H3_LORA_H
 
@@ -33,7 +33,7 @@ typedef struct h3_lora_adapter {
     size_t pair_count;
     size_t adaln_pair_count;
     uint64_t resident_bytes;
-    /* Cache identity: path plus size plus mtime (SPEC 6ter.5). */
+    /* Cache identity: path plus size plus mtime. */
     uint64_t size;
     int64_t mtime_seconds;
     int64_t mtime_nanoseconds;
@@ -51,7 +51,7 @@ typedef struct {
     size_t count;
 } h3_lora_set;
 
-/* --lora PATH[:STRENGTH] (SPEC 4, G3): split on the LAST colon, because a
+/* --lora PATH[:STRENGTH]: split on the LAST colon, because a
  * colon is legal in a macOS file name. A tail that is not a finite number is
  * an error and never a path: falling back to the whole string would report
  * "file not found" for ":0.8x" and point at the wrong thing. `argument` is
@@ -68,7 +68,7 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
                                h3_report_callback report, void *opaque);
 void h3_lora_adapter_free(h3_lora_adapter *adapter);
 
-/* The activation report of SPEC 5.1. */
+/* The one-time activation report. */
 void h3_lora_emit_report(const h3_lora_adapter *adapter,
                          h3_report_callback report, void *opaque);
 
@@ -79,7 +79,7 @@ int h3_lora_preload(h3_ctx *ctx, const char *path,
 void h3_lora_release(h3_ctx *ctx, const char *path);
 void h3_lora_release_all(h3_ctx *ctx);
 
-/* One materialised branch of the delta path (SPEC 7bis.4). `a` is a bf16 copy
+/* One materialised branch of the delta path. `a` is a bf16 copy
  * of the file's lora_A with `strength * alpha/rank` already multiplied in, so
  * nothing scales at dispatch time and the cached adapter stays untouched. */
 typedef struct {
@@ -97,7 +97,7 @@ typedef struct {
 
 /* Largest rank and largest output width over the four per-block projections
  * of the whole set. AdaLN pairs are excluded: they are a one-shot precompute,
- * not a per-step projection (SPEC 7bis.3). Both are 0 for an empty set. */
+ * not a per-step projection. Both are 0 for an empty set. */
 void h3_lora_set_extents(const h3_lora_set *set, uint64_t *max_rank,
                          uint64_t *max_out_dim);
 
@@ -110,7 +110,7 @@ int h3_lora_site_build(const h3_lora_set *set, h3_gpu *gpu, const char *name,
                        h3_lora_site *site, char *error, size_t error_size);
 void h3_lora_site_free(h3_lora_site *site);
 
-/* The three-dispatch delta branch of SPEC 7bis.4, shared by the per-step
+/* The three-dispatch delta branch, shared by the per-step
  * block projections and the one-shot AdaLN precompute. `hidden` and `delta`
  * are the caller's own scratch tensors (sized differently by each caller);
  * `label` ("LoRA" or "AdaLN LoRA") keeps the two call sites' error strings
@@ -128,7 +128,7 @@ int h3_lora_dispatch_branch(h3_gpu *gpu, const h3_lora_site *site,
 int h3_lora_set_build(h3_ctx *ctx, const h3_params *params, h3_lora_set *set);
 void h3_lora_set_free(h3_lora_set *set);
 
-/* ---- the G4 memory guardrail (SPEC 10, G4) ----
+/* ---- the G4 memory guardrail ----
  *
  * The ceiling bounds the WHOLE PROCESS, never the adapters, and both gates are
  * always active, empty active set included: that is the declared widening from
@@ -147,7 +147,7 @@ typedef struct {
 } h3_memory_ceiling;
 
 /* The 4 GiB reserve is the only fixed number of the whole design: no flag, no
- * preset, no override (SPEC 10, G4). */
+ * preset, no override. */
 void h3_memory_ceiling_take(uint64_t recommended_working_set,
                             h3_memory_ceiling *ceiling);
 

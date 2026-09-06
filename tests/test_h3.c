@@ -397,7 +397,7 @@ static void test_terminal_zoom(void) {
     CHECK(!h3_terminal_display_dimensions(INT32_MAX, 1, &width, &height));
 }
 
-/* The two G4 stop strings are contract (SPEC 5bis.5): each names which of the
+/* The two G4 stop strings are contract: each names which of the
  * two min() terms bit, by the physical thing and never by a gate number. */
 static void test_memory_guardrail(void) {
     char error[512];

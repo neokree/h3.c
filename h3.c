@@ -192,7 +192,7 @@ static char *h3_prepared_key(const char *conditioning,
     }
     /* The active set is part of the prepared-DiT identity: a different key
      * frees and reloads it, which is what redoes refine_text and the AdaLN
-     * precompute. Order is significant and never sorted (SPEC 7bis.5). */
+     * precompute. Order is significant and never sorted. */
     for (size_t index = 0; index < loras->count; index++) {
         if (!h3_key_file(&key, "lora", loras->entries[index].adapter->path) ||
             !h3_key_append(&key, "|strength=%.9g",

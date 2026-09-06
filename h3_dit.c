@@ -46,7 +46,7 @@ typedef struct {
     h3_gpu_tensor *fc1_scales;
     h3_gpu_tensor *fc2_int8;
     h3_gpu_tensor *fc2_scales;
-    /* SPEC 7.1: one site per targeted projection. Zeroed unless the active
+    /* one site per targeted projection. Zeroed unless the active
      * set carries a pair for this block, so a block with no LoRA costs
      * nothing and dispatches nothing (H4). */
     h3_lora_site lora_qkv;
@@ -202,7 +202,7 @@ struct h3_dit {
     h3_gpu_tensor *video_output_bf16;
     h3_gpu_tensor *previous_audio_velocity;
     h3_gpu_tensor *previous_video_velocity;
-    /* SPEC 7bis.4: one shared bf16 intermediate for every branch of every
+    /* one shared bf16 intermediate for every branch of every
      * projection of every block, sized on the active set's maximum rank, plus
      * one shared delta of the widest targeted output. Both are allocated at
      * load, so the denoise loop still allocates nothing. */
@@ -527,7 +527,7 @@ static uint32_t token_reduced_parent(const h3_dit *dit, uint32_t full_row) {
 }
 
 /* The four sites of one block, resolved by target name. Both weight paths go
- * through here, and so do the two token-refiner blocks (SPEC 7.1, 7bis.2). */
+ * through here, and so do the two token-refiner blocks. */
 static int load_block_loras(h3_dit *dit, h3_dit_block *block,
                             const char *prefix,
                             char *error, size_t error_size) {
@@ -811,7 +811,7 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
     return 1;
 }
 
-/* SPEC 7bis.4: the delta path, shared with the AdaLN precompute
+/* the delta path, shared with the AdaLN precompute
  * (h3_dit_schedule.c) through h3_lora_dispatch_branch. This wrapper only
  * supplies this DiT's own scratch tensors and the "LoRA" label that keeps its
  * dispatch failures distinguishable from the AdaLN ones. */
@@ -1754,7 +1754,7 @@ static h3_dit *load_dit(const char *weight_directory,
         dit->loras = loras;
         uint64_t max_rank = 0, max_out_dim = 0;
         h3_lora_set_extents(loras, &max_rank, &max_out_dim);
-        /* SPEC 7bis.4: one shared intermediate on the maximum rank, because
+        /* one shared intermediate on the maximum rank, because
          * the rank is a property of the pair, plus one shared delta. Allocated
          * here, at load, so the denoise loop keeps reporting alloc=0.000GiB. */
         if (max_rank) {
@@ -2023,7 +2023,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->use_slower_uncached_int8_scales),
            "DiT int8 QKV projection/norm/RoPE");
     } else if (weight->lora_qkv.count) {
-        /* SPEC 7bis.1: the wrapper's own two halves, spelled out, because the
+        /* the wrapper's own two halves, spelled out, because the
          * delta belongs between them and dit->qkv is the raw projection. The
          * M5-only fused kernel is not touched: on this device the wrapper
          * takes exactly this fallback anyway (h3_gpu.m:3805-3810). */

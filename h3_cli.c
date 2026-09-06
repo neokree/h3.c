@@ -153,7 +153,7 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 
 /* Every line carries the "h3: " prefix, not just the first: a report can
  * interleave with the \r progress line, and an unprefixed continuation is
- * indistinguishable from model output (SPEC 5bis.1). The library prints
+ * indistinguishable from model output. The library prints
  * nothing for itself. */
 static void cli_report(const char *line, void *opaque) {
     h3_cli_state *state = opaque;
@@ -198,7 +198,7 @@ static void free_loras(h3_cli_state *state) {
     state->lora_count = 0;
 }
 
-/* The one !status line: basenames, never the whole path (SPEC 5.2). */
+/* The one !status line: basenames, never the whole path. */
 static void print_lora_status(const h3_cli_state *state) {
     if (!state->lora_count) {
         puts("LoRA: none");
@@ -527,7 +527,7 @@ static int generate(h3_cli_state *state, const char *prompt) {
     params.on_frame = params.preview_denoise ? cli_frame : NULL;
     params.on_progress = cli_progress;
     params.on_report = cli_report;
-    /* The active set is replaced wholesale per generation (SPEC 6ter.8), and
+    /* The active set is replaced wholesale per generation, and
      * the list has moved if it was grown since the last one. */
     params.loras = state->loras;
     params.lora_count = state->lora_count;
@@ -588,7 +588,7 @@ static char *next_token(char **cursor) {
 }
 
 /* Same domain as --lora on the other surface: anything finite, and nothing
- * else (SPEC 4). Only the reaction differs. */
+ * else. Only the reaction differs. */
 static int parse_strength(const char *text, float *value) {
     char *end = NULL;
     errno = 0;
@@ -634,7 +634,7 @@ static void lora_command(h3_cli_state *state, char *argument) {
     float strength = 1.0f;
     if (strength_text && !parse_strength(strength_text, &strength)) {
         /* Keeping the previous value silently would let the user believe
-         * something changed, so it is named (SPEC 5bis.4). A first add has
+         * something changed, so it is named. A first add has
          * no previous value to keep, so it simply does not land. */
         if (index < state->lora_count)
             fprintf(stderr, "lora: invalid strength: %s; keeping %.2f\n",
@@ -644,7 +644,7 @@ static void lora_command(h3_cli_state *state, char *argument) {
         return;
     }
     /* Validate before touching the list: a fatal load leaves the previous
-     * active set in place, and the CLI says so (SPEC 5bis.6). A new strength
+     * active set in place, and the CLI says so. A new strength
      * reloads nothing, params carries it. */
     if (adding && !h3_lora_preload(state->ctx, path, cli_report, state)) {
         fprintf(stderr, "h3: %s\n", h3_last_error(state->ctx));

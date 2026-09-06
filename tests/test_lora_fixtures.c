@@ -1,10 +1,10 @@
-/* Synthetic half of the LoRA corpus (docs/SPEC.md 8bis): T3, T3b, T4, T4b.
+/* Synthetic half of the LoRA corpus: T3, T3b, T4, T4b.
  *
  * The subject here is a file's CONTENT - names, shapes, metadata, a broken
  * header - so every file is synthesised in a temporary directory at each run
  * and deleted on exit. Nothing is committed and nothing is downloaded, which
  * is why these checks CANNOT skip: the AdaLN count and the conversion warning
- * of SPEC 5.1 are verified exactly on the machine that has no checkpoint.
+ * are verified exactly on the machine that has no checkpoint.
  *
  * Safetensors is a uint64 length, a JSON header and raw bytes, so the writer
  * below is thirty lines of C rather than a Python script. The pair bytes are
@@ -12,8 +12,8 @@
  *
  * The checkpoint is synthesised too. h3_lora_parse resolves every pair against
  * the transformer shard headers, so the eleven fixtures need a shard to be
- * resolved against: one tiny file carrying the six target names of SPEC 7.1 at
- * toy shapes. Real shapes would need the real 62 GB.
+ * resolved against: one tiny file carrying the six target names at toy
+ * shapes. Real shapes would need the real 62 GB.
  */
 
 #include "h3_lora.h"
@@ -175,8 +175,8 @@ static void path_in(char *buffer, size_t size, const char *name) {
     snprintf(buffer, size, "%s/%s", root, name);
 }
 
-/* The toy checkpoint. Six targets: the four projections of SPEC 7.1 plus the
- * two AdaLN precompute targets of G1, at shapes small enough to write. */
+/* The toy checkpoint. Six targets: the four projections plus the two AdaLN
+ * precompute targets, at shapes small enough to write. */
 enum { QKV_OUT = 24, QKV_IN = 8, OUT_OUT = 8, OUT_IN = 12,
        FC1_OUT = 32, FC1_IN = 8, ADALN_OUT = 48, ADALN_IN = 8 };
 
@@ -359,7 +359,7 @@ static void test_parser(char paths[11][700]) {
     CHECK(find_pair(mixed, "blocks.0.mlp.fc1")->rank == 8);
     h3_lora_adapter_free(mixed);
 
-    /* SPEC 5bis.3: one offender, and the message names what h3 does read. */
+    /* one offender, and the message names what h3 does read. */
     CHECK(parse(paths[4], summary, sizeof(summary)) == NULL);
     CHECK(strstr(summary, "lora_up/lora_down naming is not supported"));
     CHECK(line_with("first seen at") != NULL);
@@ -377,7 +377,7 @@ static void test_parser(char paths[11][700]) {
     h3_lora_adapter_free(foreign);
 }
 
-/* T3b: --lora PATH[:STRENGTH] splits on the LAST colon (SPEC 4, G3). */
+/* T3b: --lora PATH[:STRENGTH] splits on the LAST colon. */
 static void test_command_line(char paths[11][700]) {
     char argument[800];
     const char *tail = NULL;
@@ -427,7 +427,7 @@ static void test_command_line(char paths[11][700]) {
 
     /* The other half of the same rule: a tail that is not a finite number is
      * an error and never part of the path, so a colon path given without a
-     * strength is refused with the tail quoted (SPEC 5bis.4). */
+     * strength is refused with the tail quoted. */
     snprintf(argument, sizeof(argument), "%s", colon_path);
     CHECK(!h3_lora_parse_argument(argument, &requested[0], &tail));
     CHECK(tail != NULL && !strcmp(tail, "00 turbo.safetensors"));
@@ -465,7 +465,7 @@ static void test_rejection(char paths[11][700]) {
     CHECK(strstr(summary, "truncated file") != NULL);
 }
 
-/* T4b: the shape of the report (SPEC 5.1). */
+/* T4b: the shape of the report. */
 static void test_report(char paths[11][700]) {
     char summary[512];
 
