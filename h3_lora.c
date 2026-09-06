@@ -57,8 +57,16 @@ enum {
     H3_LORA_SHAPE_MISMATCH,
     H3_LORA_NO_B,
     H3_LORA_RANK_DISAGREE,
-    H3_LORA_NOT_MATRIX
+    H3_LORA_NOT_MATRIX,
+    H3_LORA_DTYPE
 };
+
+/* The two dtypes a pair may be written in. F16 is the reason this is a check
+ * and not an assumption: it is the same width as bf16, so reading it as one
+ * would pass every length check and produce silent nonsense. */
+static int h3_lora_readable_dtype(h3_dtype dtype) {
+    return dtype == H3_DTYPE_BF16 || dtype == H3_DTYPE_F32;
+}
 
 typedef struct {
     int status;
@@ -333,6 +341,12 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
             continue;
         }
         pair->b = *b;
+        if (!h3_lora_readable_dtype(a->dtype) ||
+            !h3_lora_readable_dtype(b->dtype)) {
+            check->status = H3_LORA_DTYPE;
+            incoherent++;
+            continue;
+        }
         if (a->ndim != 2 || b->ndim != 2) {
             check->status = H3_LORA_NOT_MATRIX;
             incoherent++;
@@ -394,7 +408,11 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
                          "scale; using scale 1.0", path, alpha_tensor->name,
                          h3_dtype_name(alpha_tensor->dtype));
         }
-        resident += (a->data_end - a->data_begin) + (b->data_end - b->data_begin);
+        /* What the pair becomes on the GPU, not what it costs on disk: an F32
+         * file halves on the way there, and a budget built on the disk figure
+         * would refuse runs that fit. */
+        resident += ((uint64_t)pair->rank * pair->in_dim +
+                     (uint64_t)pair->out_dim * pair->rank) * sizeof(uint16_t);
     }
 
     if (incoherent) {
@@ -407,6 +425,11 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
                 h3_lora_line(report, opaque,
                              "  inconsistent pair: %s has no %s",
                              check->name, convention->b_label);
+            } else if (check->status == H3_LORA_DTYPE) {
+                h3_lora_line(report, opaque,
+                             "  inconsistent pair: %s is %s, which h3 reads "
+                             "neither as BF16 nor as F32", check->name,
+                             h3_dtype_name(pairs[index].a.dtype));
             } else if (check->status == H3_LORA_NOT_MATRIX) {
                 h3_lora_line(report, opaque,
                              "  inconsistent pair: %s is not a matrix pair",
@@ -823,6 +846,43 @@ void h3_lora_set_extents(const h3_lora_set *set, uint64_t *max_rank,
     }
 }
 
+/* Read one half of a pair into `out` as bf16, with `scale` folded in on the
+ * way. The file may write either dtype the parse admits; F32 needs a wide
+ * buffer of its own, because the bf16 destination is half the width. The scale
+ * rides along here rather than in a second pass over the same array. */
+static int h3_lora_read_half(const h3_st_header *header,
+                             const h3_st_tensor *tensor, uint16_t *out,
+                             size_t count, float scale,
+                             char *error, size_t error_size) {
+    if (tensor->dtype == H3_DTYPE_BF16) {
+        if (!h3_st_read_data(header, tensor, out, count * sizeof(*out), error,
+                             error_size)) {
+            return 0;
+        }
+        if (scale == 1.0f) return 1;
+        for (size_t index = 0; index < count; index++) {
+            out[index] = h3_lora_float_to_bf16(
+                h3_lora_bf16_to_float(out[index]) * scale);
+        }
+        return 1;
+    }
+    /* The parse admits no third dtype, so this is F32. */
+    float *wide = malloc(count * sizeof(*wide));
+    if (!wide) {
+        snprintf(error, error_size, "out of memory reading %s", tensor->name);
+        return 0;
+    }
+    int ok = h3_st_read_data(header, tensor, wide, count * sizeof(*wide),
+                             error, error_size);
+    if (ok) {
+        for (size_t index = 0; index < count; index++) {
+            out[index] = h3_lora_float_to_bf16(wide[index] * scale);
+        }
+    }
+    free(wide);
+    return ok;
+}
+
 static int h3_lora_branch_build(const h3_lora_entry *entry,
                                 const h3_lora_pair *pair, h3_gpu *gpu,
                                 h3_lora_branch *branch,
@@ -836,20 +896,16 @@ static int h3_lora_branch_build(const h3_lora_entry *entry,
         snprintf(error, error_size, "out of memory materialising LoRA %s",
                  pair->name);
     } else {
-        ok = h3_st_read_data(&entry->adapter->header, &pair->a, a,
-                             a_count * sizeof(*a), error, error_size) &&
-             h3_st_read_data(&entry->adapter->header, &pair->b, b,
-                             b_count * sizeof(*b), error, error_size);
+        /* strength * alpha/rank is fused into A here, as it is read. Never
+         * into the cached adapter, which is keyed by path, size and mtime, and
+         * never at dispatch time. B carries no scale. */
+        float scale = entry->strength * pair->scale;
+        ok = h3_lora_read_half(&entry->adapter->header, &pair->a, a, a_count,
+                               scale, error, error_size) &&
+             h3_lora_read_half(&entry->adapter->header, &pair->b, b, b_count,
+                               1.0f, error, error_size);
     }
     if (ok) {
-        /* strength * alpha/rank is fused here, into this bf16
-         * copy of A. Never into the cached adapter, which is keyed by path,
-         * size and mtime, and never at dispatch time. */
-        float scale = entry->strength * pair->scale;
-        for (size_t index = 0; index < a_count; index++) {
-            a[index] = h3_lora_float_to_bf16(
-                h3_lora_bf16_to_float(a[index]) * scale);
-        }
         branch->a = h3_gpu_tensor_from_bf16(gpu, a, a_count);
         branch->b = h3_gpu_tensor_from_bf16(gpu, b, b_count);
         branch->rank = (uint32_t)pair->rank;

@@ -25,7 +25,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define FIXTURE_COUNT 12
+#define FIXTURE_COUNT 13
 
 static int checks;
 
@@ -257,6 +257,14 @@ static void write_all(char paths[FIXTURE_COUNT][700]) {
     /* The same convention naming a block the checkpoint does not have. A
      * flattened name that resolves to nothing is unapplicable, the error that
      * already exists, and never a name h3 guesses the dots back into. */
+    /* F32 pairs. The corpus correlates dtype with convention (both
+     * convention-B files are F32, all three convention-A ones bf16), but that
+     * is an accident of the corpus: this one is convention A, so nothing can
+     * tie the two together by accident. */
+    static const fixture_tensor float32[] = {
+        {"blocks.0.attn.qkv_proj.lora_A.weight", "F32", 2, {4, QKV_IN}, NULL},
+        {"blocks.0.attn.qkv_proj.lora_B.weight", "F32", 2, {QKV_OUT, 4}, NULL}
+    };
     static const fixture_tensor convention_b_no_target[] = {
         {"lora_unet_blocks_51_attn_qkv_proj.lora_down.weight", "BF16", 2,
          {4, QKV_IN}, NULL},
@@ -297,7 +305,8 @@ static void write_all(char paths[FIXTURE_COUNT][700]) {
         "09-truncated.safetensors",
         "10-converted.safetensors",
         "11-adaln-pairs.safetensors",
-        "12-convention-b-no-target.safetensors"
+        "12-convention-b-no-target.safetensors",
+        "13-float32-pairs.safetensors"
     };
     for (size_t index = 0; index < FIXTURE_COUNT; index++) {
         path_in(paths[index], 700, names[index]);
@@ -329,6 +338,8 @@ static void write_all(char paths[FIXTURE_COUNT][700]) {
     write_fixture(paths[11], NULL, convention_b_no_target,
                   sizeof(convention_b_no_target) /
                   sizeof(*convention_b_no_target));
+    write_fixture(paths[12], NULL, float32,
+                  sizeof(float32) / sizeof(*float32));
 }
 
 /* ---- the checks ---- */
@@ -419,6 +430,36 @@ static void test_parser(char paths[FIXTURE_COUNT][700]) {
     CHECK(strncmp(warning, "warning:", 8) == 0);
     CHECK(strstr(warning, "stabilityai/stable-diffusion-3") != NULL);
     h3_lora_adapter_free(foreign);
+}
+
+/* F32 pairs load and materialise, and the budget counts what they become on
+ * the GPU rather than what they occupy on disk. */
+static void test_float32(char paths[FIXTURE_COUNT][700], h3_gpu *gpu) {
+    char summary[512], error[512];
+
+    h3_lora_adapter *adapter = parse(paths[12], summary, sizeof(summary));
+    CHECK(adapter != NULL);
+    CHECK(adapter->pair_count == 1);
+    CHECK(adapter->pairs[0].rank == 4);
+
+    /* 32 elements in A and 96 in B, resident in bf16: 256 bytes, not the 512
+     * the file spends on them. A budget that counted the disk figure would
+     * refuse runs that fit. */
+    CHECK(adapter->resident_bytes == (4 * QKV_IN + QKV_OUT * 4) * 2);
+
+    /* The materialised branch: the read is where an assumed 16-bit dtype
+     * shows up, as a length the tensor does not have. */
+    h3_lora_entry entry = {adapter, 1.0f};
+    h3_lora_set set = {&entry, 1};
+    h3_lora_site site;
+    error[0] = '\0';
+    CHECK(h3_lora_site_build(&set, gpu, "blocks.0.attn.qkv_proj", &site, error,
+                             sizeof(error)));
+    CHECK(error[0] == '\0');
+    CHECK(site.count == 1);
+    CHECK(site.branches[0].rank == 4);
+    h3_lora_site_free(&site);
+    h3_lora_adapter_free(adapter);
 }
 
 /* T3b: --lora PATH[:STRENGTH] splits on the LAST colon. */
@@ -567,11 +608,22 @@ int main(void) {
     write_checkpoint();
     write_all(paths);
 
+    char gpu_error[512];
+    h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", gpu_error,
+                                sizeof(gpu_error));
+    if (!gpu) {
+        fprintf(stderr, "FAIL %s: cannot create a GPU: %s\n", __FILE__,
+                gpu_error);
+        return 1;
+    }
+
     test_parser(paths);
+    test_float32(paths, gpu);
     test_command_line(paths);
     test_rejection(paths);
     test_report(paths);
 
+    h3_gpu_free(gpu);
     printf("ok: %d checks on %d synthetic LoRA fixtures\n", checks,
            FIXTURE_COUNT);
     return 0;

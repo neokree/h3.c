@@ -59,6 +59,14 @@ backbone and rank 16 on its AdaLN pairs. It is read from the shape of `A`
 (`[rank, in]`) and `B` (`[out, rank]`); if the two disagree the pair is
 internally inconsistent and the load is fatal.
 
+**Pairs are bf16 or F32**, and an F32 pair is converted on the way to the GPU,
+in the same pass that folds the scale into `A`. The dtype is orthogonal to the
+naming: the corpus correlates them (both convention-B files are F32, all three
+convention-A ones bf16) but that is an accident of the corpus, not a rule. Any
+other dtype is refused by name rather than assumed. F16 is the reason that is a
+check and not an assumption: it is the same width as bf16, so reading it as one
+would pass every length check and produce silent nonsense.
+
 **`.alpha` is the file's own scale**, applied as `alpha/rank` and multiplied by
 the user's strength rather than replaced by it. Absent means 1.0. An `.alpha` in
 a dtype the loader cannot read produces a warning, never a silent 1.0.
