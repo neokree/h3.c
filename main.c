@@ -107,7 +107,7 @@ static uint64_t parse_u64(const char *value, const char *label) {
 }
 
 /* --lora PATH[:STRENGTH]. The last-colon rule itself lives in h3_lora.c so a
- * test can reach it (SPEC 8, T3b); `argument` is argv memory, truncated in
+ * test can reach it; `argument` is argv memory, truncated in
  * place at the colon. */
 static void parse_lora(char *argument, h3_lora *lora) {
     const char *tail = NULL;
@@ -188,7 +188,7 @@ static int cli_progress(const char *phase, int completed, int total,
 
 /* Every line carries the "h3: " prefix, not just the first: a report can
  * interleave with the \r progress line, and an unprefixed continuation is
- * indistinguishable from model output (SPEC 5bis.1). */
+ * indistinguishable from model output. */
 static void cli_report(const char *line, void *opaque) {
     cli_state *state = opaque;
     if (state->active) {

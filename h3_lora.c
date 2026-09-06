@@ -21,7 +21,8 @@
 #define H3_LORA_WEIGHT_SUFFIX ".weight"
 
 /* The pipeline LoRA applies to. Ref2VA is a separate DiT that this build has
- * no adapter corpus for; validating against FL2VA is what SPEC 7.1 measured.
+ * no adapter corpus for; FL2VA is the pipeline the target coverage of
+ * docs/lora.md was measured on.
  * ponytail: one pipeline, no selector until a Ref2VA LoRA exists. */
 #define H3_LORA_TRANSFORMER_DIR "FL2VA/transformer"
 
@@ -70,7 +71,7 @@ static int h3_lora_has_suffix(const char *value, const char *suffix) {
 static char *h3_lora_pair_name(const char *key, const char *suffix) {
     const char *start = key;
     size_t prefix_length = strlen(H3_LORA_PREFIX);
-    /* The prefix is optional (SPEC 7.2), and stripping it must leave a name. */
+    /* The prefix is optional, and stripping it must leave a name. */
     if (!strncmp(start, H3_LORA_PREFIX, prefix_length) &&
         strlen(start + prefix_length) > strlen(suffix)) {
         start += prefix_length;
@@ -210,7 +211,7 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
         }
     }
 
-    /* SPEC 7.3: a suffix h3 does not read is fatal and named by category, the
+    /* a suffix h3 does not read is fatal and named by category, the
      * way llama.cpp throws (src/llama-adapter.cpp:291). Dropping it would load
      * a DoRA-style file as a plain LoRA and report nothing (H5). One offender,
      * because the extra key is a property of the file. */
@@ -225,7 +226,7 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
         return NULL;
     }
 
-    /* Shard headers only, no weight bytes (SPEC 6ter.3): h3_weight_store_open
+    /* Shard headers only, no weight bytes: h3_weight_store_open
      * already opens every safetensors header in the directory, which is the
      * same property the target index used to build for itself. Its error text
      * is already in `detail` on failure, so it is propagated as-is. */
@@ -471,7 +472,7 @@ void h3_lora_adapter_free(h3_lora_adapter *adapter) {
     free(adapter);
 }
 
-/* ---- the activation report (SPEC 5.1) ---- */
+/* ---- the activation report ---- */
 
 static const char *const h3_lora_signature_keys[] = {
     "partial_conversion", "removed_pair_count", "adaln_keys_removed"
@@ -481,7 +482,7 @@ void h3_lora_emit_report(const h3_lora_adapter *adapter,
                          h3_report_callback report, void *opaque) {
     if (!adapter || !report) return;
 
-    /* Rank histogram, ordered by descending count (SPEC 5.1). */
+    /* Rank histogram, ordered by descending count. */
     uint64_t ranks[64];
     size_t counts[64];
     size_t distinct = 0;
@@ -566,7 +567,7 @@ void h3_lora_emit_report(const h3_lora_adapter *adapter,
     }
 
     /* base_model is informative and written by the converter: warn, never
-     * fail (SPEC 8, T3). */
+     * fail. */
     const char *base = h3_st_metadata(&adapter->header, "base_model");
     if (!base) {
         base = h3_st_metadata(&adapter->header, "ss_base_model_version");
@@ -589,7 +590,7 @@ void h3_lora_emit_report(const h3_lora_adapter *adapter,
     }
 }
 
-/* ---- the h3_ctx cache (SPEC 6ter.5) ---- */
+/* ---- the h3_ctx cache ---- */
 
 static char *h3_lora_transformer_dir(h3_ctx *ctx) {
     if (!ctx || !ctx->model_dir) return NULL;
@@ -733,7 +734,7 @@ void h3_lora_set_free(h3_lora_set *set) {
     memset(set, 0, sizeof(*set));
 }
 
-/* ---- the GPU delta branch (SPEC 7bis.4) ---- */
+/* ---- the GPU delta branch ---- */
 
 static float h3_lora_bf16_to_float(uint16_t bits) {
     uint32_t widened = (uint32_t)bits << 16;
@@ -753,7 +754,7 @@ static uint16_t h3_lora_float_to_bf16(float value) {
 
 /* The pair name resolves the site by itself: an AdaLN pair is named
  * "blocks.N.adaln_proj.linear" and can never collide with the four per-block
- * projections, so one builder serves both kinds of target (SPEC 7bis.3). */
+ * projections, so one builder serves both kinds of target. */
 static int h3_lora_pair_targets(const h3_lora_pair *pair, const char *name) {
     return !strcmp(pair->name, name);
 }
@@ -793,7 +794,7 @@ static int h3_lora_branch_build(const h3_lora_entry *entry,
                              b_count * sizeof(*b), error, error_size);
     }
     if (ok) {
-        /* SPEC 7bis.4: strength * alpha/rank is fused here, into this bf16
+        /* strength * alpha/rank is fused here, into this bf16
          * copy of A. Never into the cached adapter, which is keyed by path,
          * size and mtime, and never at dispatch time. */
         float scale = entry->strength * pair->scale;
@@ -866,7 +867,7 @@ void h3_lora_site_free(h3_lora_site *site) {
     memset(site, 0, sizeof(*site));
 }
 
-/* SPEC 7bis.4: the whole delta path, three dispatches on kernels that already
+/* the whole delta path, three dispatches on kernels that already
  * exist, once per branch and strictly sequentially. Shared by the per-step
  * block projections (h3_dit.c, label "LoRA") and the one-shot AdaLN precompute
  * (h3_dit_schedule.c, label "AdaLN LoRA"), which differ only in which scratch
@@ -912,7 +913,7 @@ int h3_lora_dispatch_branch(h3_gpu *gpu, const h3_lora_site *site,
     return 1;
 }
 
-/* ---- the G4 memory guardrail (SPEC 10, G4) ----
+/* ---- the G4 memory guardrail ----
  *
  * The ceiling is on the whole process and both gates are always active, empty
  * active set included. At the ceiling h3 stops: never a partial active set. */
@@ -921,7 +922,7 @@ int h3_lora_dispatch_branch(h3_gpu *gpu, const h3_lora_site *site,
  * it says what must stay standing while h3 holds 22 GB, not what h3 needs. */
 #define H3_MEMORY_RESERVE_BYTES (UINT64_C(4) << 30)
 
-/* SPEC 10, "l'aritmetica di supporto": with --ssd-streaming the DiT holds the
+/* with --ssd-streaming the DiT holds the
  * block norms plus two alternating BF16 matrix slots. One slot is
  * 21504*5376 + 5376*7168 + 28672*5376 + 5376*14336 = 385,351,680 elements. */
 #define H3_MEMORY_WEIGHT_SLOT_BYTES (UINT64_C(385351680) * 2)
@@ -979,7 +980,7 @@ void h3_memory_ceiling_take(uint64_t recommended_working_set,
  * remedy differs: the Metal working set wants a smaller canvas, system free
  * wants the co-resident process gone. The term is named by the physical thing,
  * never by our project words, and the gates are never numbered: "gate 1" and
- * "gate 2" are our vocabulary too (SPEC 5bis.5). Returns the remedy line. */
+ * "gate 2" are our vocabulary too. Returns the remedy line. */
 static const char *h3_memory_term(const h3_memory_ceiling *ceiling,
                                   char *term, size_t term_size) {
     if (ceiling->system_free_bit) {

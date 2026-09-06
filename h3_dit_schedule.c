@@ -235,7 +235,7 @@ cleanup:
 }
 
 /* The delta branch for the two AdaLN targets. Same three dispatches as the
- * four per-step projections (SPEC 7bis.4), on the same shared intermediate,
+ * four per-step projections, on the same shared intermediate,
  * except that here the "rows" are timestep rows and the whole thing runs once
  * at load: both tensors below are gone before the denoiser starts. One delta
  * buffer covers both targets, because FINAL_OUTPUT < BLOCK_OUTPUT. */
@@ -257,7 +257,7 @@ static uint64_t adaln_lora_rank(const h3_lora_set *loras) {
         for (size_t which = 0; which < adapter->pair_count; which++) {
             const h3_lora_pair *pair = &adapter->pairs[which];
             /* Read per pair, never per file: upstream is rank 16 here and 64
-             * on the backbone (SPEC 7.2). */
+             * on the backbone. */
             if (pair->adaln && pair->rank > rank) rank = pair->rank;
         }
     }
@@ -382,7 +382,7 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     schedule->final = h3_gpu_tensor_new_bf16(
         gpu, (size_t)schedule->time_rows * FINAL_OUTPUT);
     /* One pair, not one per block: final_layer is the 51st AdaLN target
-     * (SPEC 7.1). */
+     *. */
     /* Zeroed up front: the short-circuit below can skip the build, and the
      * free runs either way. */
     h3_lora_site final_site = {NULL, 0};
