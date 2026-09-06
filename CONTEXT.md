@@ -79,8 +79,9 @@ real process footprint. It bounds the whole process, not the adapters.
 _Avoid_: cap, budget, limit (there is no static adapter cap)
 
 **Load report**:
-The one-time summary printed when an active set is activated: pair count, rank
-histogram, AdaLN pair count, and any conversion warning. Leaves the library
+The one-time summary printed when an active set is activated: pair count, the
+convention the file was read under, rank histogram, AdaLN pair count, and any
+conversion warning. Leaves the library
 through a callback; the library never prints for itself.
 _Avoid_: log, output
 

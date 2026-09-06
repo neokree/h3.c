@@ -28,6 +28,12 @@ typedef struct {
 
 typedef struct h3_lora_adapter {
     char *path;                 /* the path as the caller wrote it */
+    /* The two halves as the file spelled them, "lora_A"/"lora_B" or
+     * "lora_down"/"lora_up". Static strings, so the adapter owns neither.
+     * Carried past the parse for the report: when a file loads and the render
+     * is wrong, which spelling was read is the first thing to rule out. */
+    const char *a_label;
+    const char *b_label;
     h3_st_header header;        /* tensor table; weight bytes stay on disk */
     h3_lora_pair *pairs;
     size_t pair_count;

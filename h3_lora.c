@@ -517,6 +517,8 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
         goto failed;
     }
     adapter->path = path_copy;
+    adapter->a_label = convention->a_label;
+    adapter->b_label = convention->b_label;
     adapter->header = header;
     adapter->pairs = pairs;
     adapter->pair_count = pair_count;
@@ -608,9 +610,10 @@ void h3_lora_emit_report(const h3_lora_adapter *adapter,
     }
 
     h3_lora_line(report, opaque,
-                 "%s: %zu pair%s applied, ranks: %s%s, AdaLN pairs: %zu, "
-                 "resident %.1f MiB", adapter->path, adapter->pair_count,
-                 H3_LORA_PLURAL(adapter->pair_count),
+                 "%s: %zu pair%s applied, convention: %s/%s, ranks: %s%s, "
+                 "AdaLN pairs: %zu, resident %.1f MiB", adapter->path,
+                 adapter->pair_count, H3_LORA_PLURAL(adapter->pair_count),
+                 adapter->a_label, adapter->b_label,
                  written ? histogram : "none", tail,
                  adapter->adaln_pair_count,
                  (double)adapter->resident_bytes / (1024.0 * 1024.0));

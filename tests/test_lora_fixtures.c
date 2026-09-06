@@ -562,8 +562,21 @@ static void test_report(char paths[FIXTURE_COUNT][700]) {
     CHECK(line != NULL);
     CHECK(strstr(line, "ranks: 4 x2") != NULL);      /* the histogram, not a range */
     CHECK(strstr(line, "AdaLN pairs: 0") != NULL);   /* declared even at zero */
+    /* Which spelling was read. When a file loads but the render is wrong, this
+     * is the first thing to rule out, and naming the two halves answers it
+     * without going back to the source. */
+    CHECK(strstr(line, "convention: lora_A/lora_B") != NULL);
     CHECK(line_with("warning:") == NULL);
     h3_lora_adapter_free(minimal);
+
+    /* The other spelling reports itself, in the order it is read: down is the
+     * [rank, in] half and up the [out, rank] one. */
+    h3_lora_adapter *flat = parse(paths[4], summary, sizeof(summary));
+    CHECK(flat != NULL);
+    capture_reset();
+    h3_lora_emit_report(flat, capture, NULL);
+    CHECK(line_with("convention: lora_down/lora_up") != NULL);
+    h3_lora_adapter_free(flat);
 
     /* The histogram is ordered by descending count, and two ranks in one file
      * come out as two entries. */

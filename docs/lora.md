@@ -291,9 +291,17 @@ recipe's canvas the headroom is ~20 GiB and nothing bites.
 
 Three text outputs, no dashboard.
 
-1. **On activation**: path, rank histogram, applied pair count, AdaLN pair count,
-   resident memory. There is no "skipped pairs" section: an unapplicable pair is
-   fatal and its list comes out of the error, not the report.
+1. **On activation**: path, applied pair count, the convention the file was read
+   under, rank histogram, AdaLN pair count, resident memory. There is no
+   "skipped pairs" section: an unapplicable pair is fatal and its list comes out
+   of the error, not the report.
+
+   The convention is named by its two halves, `convention: lora_down/lora_up`,
+   in the order they are read: the first is the `[rank, in]` half. A letter
+   would not answer the question the field exists for. When a file loads and the
+   render is wrong, whether down and up were read the right way round is the
+   first thing to rule out, and without this the only way to answer it is to
+   reread the loader.
 
    The rank histogram is a compact single line ordered by descending count,
    `ranks: 64 x208, 16 x51`. Not a range (`16-64` hides the bimodality, which is
