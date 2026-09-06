@@ -197,6 +197,12 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 # target declares it wants the files. See README, "LoRA test corpus".
 LORA_TURBO := loras/turbo.safetensors
 LORA_COMBAT := loras/combat.safetensors
+# Convention B, F32. mystic runs at strength 3 and block 24: its pairs are far
+# stronger per unit strength than turbo's, so at 100 the delta is 97% of the
+# output, a regime T1's tolerance was never calibrated in, and it only carries
+# blocks 24-49.
+LORA_MYSTIC := loras/mystic.safetensors
+LORA_ANIME := loras/anime_v7.safetensors
 # The smallest geometry that actually generates: 22 frames, 4 evaluations.
 # 5 frames is a legal canvas but not a legal run - the video VAE decoder wants
 # one trained 22-frame chunk and refuses below that.
@@ -208,6 +214,9 @@ real-lora: h3_lora_oracle_test h3
 	./h3_lora_oracle_test $(LORA_TURBO) MiniMax-H3 100 0
 	./h3_lora_oracle_test $(LORA_COMBAT) MiniMax-H3 100 0
 	./h3_lora_oracle_test $(LORA_TURBO) MiniMax-H3 100 0 $(LORA_COMBAT)
+	./h3_lora_oracle_test $(LORA_ANIME) MiniMax-H3 100 0
+	./h3_lora_oracle_test $(LORA_MYSTIC) MiniMax-H3 3 24
+	./h3_lora_oracle_test $(LORA_TURBO) MiniMax-H3 100 0 $(LORA_ANIME)
 	@# T1's significance guard, from the outside: at a strength where the
 	@# delta sinks under the BF16 noise floor the test has to FAIL, or a
 	@# weaker LoRA file would quietly turn T1 into a no-op.
@@ -230,18 +239,23 @@ real-lora: h3_lora_oracle_test h3
 lora-identity: h3
 	@set -e; \
 	dir=$$(mktemp -d /tmp/h3-t2-XXXXXX); \
-	echo "T2: two runs into $$dir"; \
+	echo "T2: three runs into $$dir"; \
 	./h3 -d MiniMax-H3 -p "$(LORA_PROMPT)" $(LORA_GEOMETRY) \
 		-o $$dir/plain.mp4 > $$dir/plain.log 2>&1; \
 	./h3 -d MiniMax-H3 -p "$(LORA_PROMPT)" $(LORA_GEOMETRY) \
 		--lora $(LORA_TURBO):0 -o $$dir/zero.mp4 > $$dir/zero.log 2>&1; \
-	if cmp $$dir/plain.mp4 $$dir/zero.mp4; then \
-		echo "ok: T2 --lora at strength 0 is byte-identical to no LoRA"; \
-		rm -rf $$dir; \
-	else \
+	./h3 -d MiniMax-H3 -p "$(LORA_PROMPT)" $(LORA_GEOMETRY) \
+		--lora $(LORA_MYSTIC):0 -o $$dir/zero-b.mp4 > $$dir/zero-b.log 2>&1; \
+	if ! cmp $$dir/plain.mp4 $$dir/zero.mp4; then \
 		echo "FAIL: T2 strength 0 changed the video; logs in $$dir"; \
 		exit 1; \
-	fi
+	fi; \
+	if ! cmp $$dir/plain.mp4 $$dir/zero-b.mp4; then \
+		echo "FAIL: T2 a convention-B file at strength 0 changed the video; logs in $$dir"; \
+		exit 1; \
+	fi; \
+	echo "ok: T2 --lora at strength 0 is byte-identical to no LoRA, on both conventions"; \
+	rm -rf $$dir
 
 # T6: one session, one seed. Generate, add a LoRA, regenerate, remove it,
 # regenerate. Two assertions, because the first alone is green even when the

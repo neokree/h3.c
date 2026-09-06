@@ -364,6 +364,31 @@ branch is measured against. Numerical agreement is measured, never asserted at a
 threshold tighter than the base matrix multiply's own error: the measured floor,
 rel-L2 1.66e-03, is bf16's, not the branch's.
 
+The reference reads a pair at the precision its file wrote, F32 included, so the
+rounding the shipped path applies on the way to the GPU is measured rather than
+cancelled, the way the strength's own rounding already is.
+
+**F32 pairs do not move the floor.** Measured on bf16-out rel-L2, with the
+control (no delta) at 1.657e-03:
+
+| file | convention | dtype | rank | strength | rel-L2 | delta share |
+|---|---|---|---:|---:|---|---|
+| turbo | A | bf16 | 64 | 100 | 2.302e-03 - 2.359e-03 | 0.9 - 1.8e-02 |
+| mystic | B | F32 | 16 | 2 | 2.363e-03 - 2.439e-03 | 8.2e-02 - 1.7e-01 |
+| mystic | B | F32 | 16 | 3 | 2.381e-03 - 2.479e-03 | 1.2e-01 - 2.5e-01 |
+| anime_v7 | B | F32 | 32 | 100 | 2.440e-03 - 2.623e-03 | 1.8e-01 - 7.0e-01 |
+
+All four sit in one band just above the base GEMM's own error. The F32 to bf16
+conversion contributes nothing measurable on top of it.
+
+**Strength is not comparable across files.** turbo at strength 100 puts the delta
+at 1-2% of the output; mystic at the same strength puts it at **97%**, a regime
+T1's tolerance was never calibrated in and where the run fails on tolerance for
+that reason alone. A file's own `alpha/rank` and the magnitude of its trained
+weights both feed this, so a strength that suits one file says nothing about
+another. The oracle target runs mystic at strength 3 and block 24, that file
+carrying only blocks 24-49.
+
 ## Dead paths on this machine
 
 `h3_gpu_grouped_qkv_linear_rope_bf16` takes its fused NAX path only when

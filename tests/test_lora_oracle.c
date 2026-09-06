@@ -182,6 +182,34 @@ static uint16_t *read_bf16_tensor(const h3_st_header *header,
     return values;
 }
 
+/* One half of a real pair, at the precision the file wrote it. The shipped
+ * path rounds an F32 pair to bf16 on its way to the GPU; the reference keeps
+ * the file's own values, so that rounding is measured rather than cancelled,
+ * the way fuse_scale already does for the strength. */
+static float *read_pair_f32(const h3_st_header *header,
+                            const h3_st_tensor *tensor, float scale,
+                            const char *what) {
+    size_t count = (size_t)h3_st_tensor_elements(tensor);
+    float *values = checked_malloc(count * sizeof(*values), what);
+    if (tensor->dtype == H3_DTYPE_F32) {
+        char error[512];
+        if (!h3_st_read_data(header, tensor, values, count * sizeof(*values),
+                             error, sizeof(error))) die(error);
+        if (scale != 1.0f) {
+            for (size_t index = 0; index < count; index++) {
+                values[index] *= scale;
+            }
+        }
+        return values;
+    }
+    uint16_t *packed = read_bf16_tensor(header, tensor, what);
+    for (size_t index = 0; index < count; index++) {
+        values[index] = bf16_to_f32(packed[index]) * scale;
+    }
+    free(packed);
+    return values;
+}
+
 /* One half of a synthetic pair, scaled so the delta lands in the regime the
  * real pairs occupy instead of drowning the base output: 1/sqrt(fan-in) on
  * each of the two GEMMs, times SYNTHETIC_AMPLITUDE. The measured delta share
@@ -467,22 +495,33 @@ int main(int argc, char **argv) {
                  * that ships; re-deriving them here would measure the test. */
                 rank[source] = (size_t)pair[source]->rank;
                 pair_scale[source] = pair[source]->scale;
-                a_bf16[source] = read_bf16_tensor(&adapters[source]->header,
-                                                  &pair[source]->a, "lora A");
-                b_bf16[source] = read_bf16_tensor(&adapters[source]->header,
-                                                  &pair[source]->b, "lora B");
+                /* No bf16 copy: the GPU side comes from the shipped
+                 * h3_lora_site_build below, and the reference reads the file
+                 * at its own precision just under here. */
+                a_bf16[source] = NULL;
+                b_bf16[source] = NULL;
             }
         }
 
         uint16_t *w_bf16 = read_bf16_tensor(shard, w_tensor, "base weight");
         const float *a_f32[MAX_SOURCES], *b_f32[MAX_SOURCES];
         for (size_t source = 0; source < sources; source++) {
-            a_f32[source] = expand_bf16(a_bf16[source],
-                                        rank[source] * input_dim, 1.0f,
-                                        "lora A f32");
-            b_f32[source] = expand_bf16(b_bf16[source],
-                                        output_dim * rank[source],
-                                        pair_scale[source], "lora B f32");
+            if (synthetic) {
+                a_f32[source] = expand_bf16(a_bf16[source],
+                                            rank[source] * input_dim, 1.0f,
+                                            "lora A f32");
+                b_f32[source] = expand_bf16(b_bf16[source],
+                                            output_dim * rank[source],
+                                            pair_scale[source], "lora B f32");
+            } else {
+                a_f32[source] = read_pair_f32(&adapters[source]->header,
+                                              &pair[source]->a, 1.0f,
+                                              "lora A f32");
+                b_f32[source] = read_pair_f32(&adapters[source]->header,
+                                              &pair[source]->b,
+                                              pair_scale[source],
+                                              "lora B f32");
+            }
         }
 
         uint64_t seed = 0x10a0000ull + which;
