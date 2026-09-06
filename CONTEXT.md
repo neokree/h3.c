@@ -2,7 +2,8 @@
 
 This context covers loading LoRA adapters at run time on the `--ssd-streaming`
 path, without baking anything into the 62 GB base checkpoint. The design map is
-issue [#1](https://github.com/neokree/h3.c/issues/1); the spec is `docs/SPEC.md`.
+issue [#1](https://github.com/neokree/h3.c/issues/1); how the shipped code
+works, with the measurements behind it, is `docs/lora.md`.
 
 The glossary is written for a reader who is not a machine-learning engineer.
 Terms in the first section are ours and are used with exactly this meaning;
@@ -57,10 +58,19 @@ feature: nothing in the LoRA path ever writes one.
 _Avoid_: model weight, original weight
 
 **Convention**:
-The naming scheme a LoRA file uses for its pairs. Convention A (`lora_A` /
-`lora_B`, optional `.alpha`) is supported; convention B (`lora_up` /
-`lora_down`) is detected and rejected with a clear error.
+The naming scheme a LoRA file uses for its pairs. Convention A names them
+`lora_A` / `lora_B` and spells the target as a dotted path; convention B names
+them `lora_down` / `lora_up` and spells it as a flattened name. Both are read,
+and either may carry an optional `.alpha`. Anything else is not a third
+convention but an unsupported file: it is named in the error and refused.
 _Avoid_: format, dialect
+
+**Flattened name**:
+A target's path with its dots turned into underscores, the spelling convention B
+writes: `blocks_24_attn_out_proj` for `blocks.24.attn.out_proj`. It is read back
+by matching it against the checkpoint's own names, so a flattened name either is
+a target or is unapplicable, and is never guessed at.
+_Avoid_: mangled name, underscore name, key
 
 **Guardrail**:
 The two measured memory gates that stop a run before it thrashes: gate 1
