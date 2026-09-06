@@ -15,10 +15,35 @@
 
 #define H3_LORA_A_SUFFIX ".lora_A.weight"
 #define H3_LORA_B_SUFFIX ".lora_B.weight"
+#define H3_LORA_DOWN_SUFFIX ".lora_down.weight"
+#define H3_LORA_UP_SUFFIX ".lora_up.weight"
 #define H3_LORA_ALPHA_SUFFIX ".alpha"
 #define H3_LORA_BIAS_SUFFIX ".diff_b"
-#define H3_LORA_PREFIX "diffusion_model."
 #define H3_LORA_WEIGHT_SUFFIX ".weight"
+
+/* Prefixes a file may put in front of the target name, each optional and
+ * stripped only when it is there: a loader that strips unconditionally finds
+ * no pairs at all on a file that carries none. */
+static const char *const H3_LORA_PREFIXES[] = {
+    "diffusion_model.",
+    "lora_unet_"
+};
+
+/* The two spellings of one pair. Which one a file uses is a property of the
+ * file, so it is decided once and then carried, never re-sniffed per key. */
+typedef struct {
+    const char *a_suffix;   /* the [rank, in] half  */
+    const char *b_suffix;   /* the [out, rank] half */
+    const char *a_label;    /* how the error messages name them */
+    const char *b_label;
+} h3_lora_convention;
+
+static const h3_lora_convention H3_LORA_CONVENTION_A = {
+    H3_LORA_A_SUFFIX, H3_LORA_B_SUFFIX, "lora_A", "lora_B"
+};
+static const h3_lora_convention H3_LORA_CONVENTION_B = {
+    H3_LORA_DOWN_SUFFIX, H3_LORA_UP_SUFFIX, "lora_down", "lora_up"
+};
 
 /* The pipeline LoRA applies to. Ref2VA is a separate DiT that this build has
  * no adapter corpus for; FL2VA is the pipeline the target coverage of
@@ -70,11 +95,16 @@ static int h3_lora_has_suffix(const char *value, const char *suffix) {
 
 static char *h3_lora_pair_name(const char *key, const char *suffix) {
     const char *start = key;
-    size_t prefix_length = strlen(H3_LORA_PREFIX);
     /* The prefix is optional, and stripping it must leave a name. */
-    if (!strncmp(start, H3_LORA_PREFIX, prefix_length) &&
-        strlen(start + prefix_length) > strlen(suffix)) {
-        start += prefix_length;
+    for (size_t which = 0; which < sizeof(H3_LORA_PREFIXES) /
+                                   sizeof(*H3_LORA_PREFIXES); which++) {
+        const char *prefix = H3_LORA_PREFIXES[which];
+        size_t prefix_length = strlen(prefix);
+        if (!strncmp(start, prefix, prefix_length) &&
+            strlen(start + prefix_length) > strlen(suffix)) {
+            start += prefix_length;
+            break;
+        }
     }
     size_t length = strlen(start) - strlen(suffix);
     char *name = malloc(length + 1);
@@ -106,8 +136,9 @@ static char *h3_lora_sibling_key(const char *key, const char *suffix,
  * other dtype falls to the default case below, which reports the tensor
  * through *found and warns instead of guessing. */
 static int h3_lora_read_alpha(const h3_st_header *header, const char *key,
-                              double *alpha, const h3_st_tensor **found) {
-    char *alpha_key = h3_lora_sibling_key(key, H3_LORA_A_SUFFIX,
+                              const char *a_suffix, double *alpha,
+                              const h3_st_tensor **found) {
+    char *alpha_key = h3_lora_sibling_key(key, a_suffix,
                                           H3_LORA_ALPHA_SUFFIX);
     if (!alpha_key) return 0;
     const h3_st_tensor *tensor = h3_st_find(header, alpha_key);
@@ -186,25 +217,30 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
         return NULL;
     }
 
-    /* Convention is a property of the file, so one offender is the proof. */
+    /* Convention is a property of the file, so one key settles it for the whole
+     * file. A file that then also carries the other spelling trips the unknown
+     * suffix check below, which names the offending suffix: there is no need
+     * for a dedicated "mixed conventions" branch. */
+    const h3_lora_convention *convention = &H3_LORA_CONVENTION_A;
+    for (size_t index = 0; index < header.tensor_count; index++) {
+        const char *key = header.tensors[index].name;
+        if (h3_lora_has_suffix(key, H3_LORA_DOWN_SUFFIX) ||
+            h3_lora_has_suffix(key, H3_LORA_UP_SUFFIX)) {
+            convention = &H3_LORA_CONVENTION_B;
+            break;
+        }
+    }
+
     const char *bias_key = NULL;
     const char *unknown_key = NULL;
     for (size_t index = 0; index < header.tensor_count; index++) {
         const char *key = header.tensors[index].name;
-        if (strstr(key, "lora_up") || strstr(key, "lora_down")) {
-            snprintf(summary, summary_size,
-                     "%s: lora_up/lora_down naming is not supported", path);
-            h3_lora_line(report, opaque,
-                         "  (first seen at %s); h3 reads lora_A/lora_B", key);
-            h3_st_free_header(&header);
-            return NULL;
-        }
         if (!bias_key && h3_lora_has_suffix(key, H3_LORA_BIAS_SUFFIX)) {
             bias_key = key;
         }
         if (!unknown_key &&
-            !h3_lora_has_suffix(key, H3_LORA_A_SUFFIX) &&
-            !h3_lora_has_suffix(key, H3_LORA_B_SUFFIX) &&
+            !h3_lora_has_suffix(key, convention->a_suffix) &&
+            !h3_lora_has_suffix(key, convention->b_suffix) &&
             !h3_lora_has_suffix(key, H3_LORA_ALPHA_SUFFIX) &&
             !h3_lora_has_suffix(key, H3_LORA_BIAS_SUFFIX)) {
             unknown_key = key;
@@ -220,8 +256,9 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
         snprintf(summary, summary_size, "%s: %s keys are not supported", path,
                  suffix ? suffix : unknown_key);
         h3_lora_line(report, opaque,
-                     "  (first seen at %s); h3 reads lora_A/lora_B pairs with "
-                     "an optional .alpha", unknown_key);
+                     "  (first seen at %s); h3 reads %s/%s pairs with an "
+                     "optional .alpha", unknown_key, convention->a_label,
+                     convention->b_label);
         h3_st_free_header(&header);
         return NULL;
     }
@@ -240,7 +277,7 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
 
     size_t capacity = 0;
     for (size_t index = 0; index < header.tensor_count; index++) {
-        if (h3_lora_has_suffix(header.tensors[index].name, H3_LORA_A_SUFFIX)) {
+        if (h3_lora_has_suffix(header.tensors[index].name, convention->a_suffix)) {
             capacity++;
         }
     }
@@ -248,9 +285,9 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
     size_t orphan_b = 0;
     for (size_t index = 0; index < header.tensor_count; index++) {
         const char *key = header.tensors[index].name;
-        if (!h3_lora_has_suffix(key, H3_LORA_B_SUFFIX)) continue;
-        char *sibling = h3_lora_sibling_key(key, H3_LORA_B_SUFFIX,
-                                            H3_LORA_A_SUFFIX);
+        if (!h3_lora_has_suffix(key, convention->b_suffix)) continue;
+        char *sibling = h3_lora_sibling_key(key, convention->b_suffix,
+                                            convention->a_suffix);
         if (!sibling) continue;
         if (!h3_st_find(&header, sibling)) orphan_b++;
         free(sibling);
@@ -274,11 +311,11 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
     uint64_t resident = 0;
     for (size_t index = 0; index < header.tensor_count; index++) {
         const h3_st_tensor *a = &header.tensors[index];
-        if (!h3_lora_has_suffix(a->name, H3_LORA_A_SUFFIX)) continue;
+        if (!h3_lora_has_suffix(a->name, convention->a_suffix)) continue;
         h3_lora_pair *pair = &pairs[pair_count];
         h3_lora_check *check = &checks[pair_count];
         pair_count++;
-        pair->name = h3_lora_pair_name(a->name, H3_LORA_A_SUFFIX);
+        pair->name = h3_lora_pair_name(a->name, convention->a_suffix);
         if (!pair->name) {
             snprintf(summary, summary_size, "%s: out of memory reading pairs",
                      path);
@@ -286,8 +323,8 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
         }
         check->name = pair->name;
         pair->a = *a;
-        char *b_key = h3_lora_sibling_key(a->name, H3_LORA_A_SUFFIX,
-                                          H3_LORA_B_SUFFIX);
+        char *b_key = h3_lora_sibling_key(a->name, convention->a_suffix,
+                                          convention->b_suffix);
         const h3_st_tensor *b = b_key ? h3_st_find(&header, b_key) : NULL;
         free(b_key);
         if (!b) {
@@ -313,6 +350,10 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
         snprintf(target_name, sizeof(target_name), "%s%s", pair->name,
                  H3_LORA_WEIGHT_SUFFIX);
         const h3_st_tensor *target = h3_weight_find(store, target_name, NULL);
+        /* Exact match first, so convention A never leaves the path it has
+         * always taken. A flattened name spells the same target with
+         * underscores, and only the checkpoint knows where the dots go. */
+        if (!target) target = h3_weight_find_flattened(store, target_name);
         /* A tensor that resolves but is not a matrix is unapplicable exactly
          * like a name with no match at all, not a crash: nothing below reads
          * shape[1] on anything but a 2D tensor. */
@@ -321,6 +362,12 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
             no_target++;
             continue;
         }
+        /* From here the pair carries the checkpoint's own spelling, which is
+         * what a site matches on. Flattening only ever swaps a separator, so
+         * the two names are the same length and this cannot overrun; on
+         * convention A it copies identical bytes. The unresolved spelling is
+         * the file's own, which is what the "no target" message above wants. */
+        memcpy(pair->name, target->name, strlen(pair->name));
         check->rows = target->shape[0];
         check->cols = target->shape[1];
         if (target->shape[0] != pair->out_dim ||
@@ -335,7 +382,8 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
         double alpha = 0.0;
         const h3_st_tensor *alpha_tensor = NULL;
         pair->scale = 1.0f;
-        if (pair->rank && h3_lora_read_alpha(&header, a->name, &alpha,
+        if (pair->rank && h3_lora_read_alpha(&header, a->name,
+                                             convention->a_suffix, &alpha,
                                              &alpha_tensor)) {
             pair->scale = (float)(alpha / (double)pair->rank);
         } else if (alpha_tensor) {
@@ -357,8 +405,8 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
             const h3_lora_check *check = &checks[index];
             if (check->status == H3_LORA_NO_B) {
                 h3_lora_line(report, opaque,
-                             "  inconsistent pair: %s has no lora_B",
-                             check->name);
+                             "  inconsistent pair: %s has no %s",
+                             check->name, convention->b_label);
             } else if (check->status == H3_LORA_NOT_MATRIX) {
                 h3_lora_line(report, opaque,
                              "  inconsistent pair: %s is not a matrix pair",
@@ -373,17 +421,17 @@ h3_lora_adapter *h3_lora_parse(const char *path, const char *transformer_dir,
         }
         for (size_t index = 0; index < header.tensor_count; index++) {
             const char *key = header.tensors[index].name;
-            if (!h3_lora_has_suffix(key, H3_LORA_B_SUFFIX)) continue;
-            char *sibling = h3_lora_sibling_key(key, H3_LORA_B_SUFFIX,
-                                                H3_LORA_A_SUFFIX);
+            if (!h3_lora_has_suffix(key, convention->b_suffix)) continue;
+            char *sibling = h3_lora_sibling_key(key, convention->b_suffix,
+                                                convention->a_suffix);
             if (!sibling) continue;
             int missing = h3_st_find(&header, sibling) == NULL;
             free(sibling);
             if (!missing) continue;
-            char *name = h3_lora_pair_name(key, H3_LORA_B_SUFFIX);
+            char *name = h3_lora_pair_name(key, convention->b_suffix);
             h3_lora_line(report, opaque,
-                         "  inconsistent pair: %s has no lora_A",
-                         name ? name : key);
+                         "  inconsistent pair: %s has no %s",
+                         name ? name : key, convention->a_label);
             free(name);
         }
         goto failed;

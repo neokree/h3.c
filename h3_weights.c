@@ -141,6 +141,37 @@ const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
     return NULL;
 }
 
+/* '.' and '_' compare equal, everything else exactly. Only names of the same
+ * length can match, because flattening swaps separators and never adds or
+ * removes a character. */
+static int same_flattened(const char *target, const char *flattened) {
+    size_t index = 0;
+    for (; target[index] && flattened[index]; index++) {
+        char left = target[index], right = flattened[index];
+        if (left == right) continue;
+        int separators = (left == '.' || left == '_') &&
+                         (right == '.' || right == '_');
+        if (!separators) return 0;
+    }
+    return !target[index] && !flattened[index];
+}
+
+const h3_st_tensor *h3_weight_find_flattened(const h3_weight_store *store,
+                                             const char *flattened) {
+    if (!store || !flattened) return NULL;
+    const h3_st_tensor *found = NULL;
+    for (size_t shard = 0; shard < store->count; shard++) {
+        const h3_st_header *header = &store->headers[shard];
+        for (size_t index = 0; index < header->tensor_count; index++) {
+            const h3_st_tensor *tensor = &header->tensors[index];
+            if (!same_flattened(tensor->name, flattened)) continue;
+            if (found) return NULL;   /* ambiguous: resolve nothing */
+            found = tensor;
+        }
+    }
+    return found;
+}
+
 static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
                                   const char *name, int ndim,
                                   const uint64_t *shape, h3_dtype dtype,

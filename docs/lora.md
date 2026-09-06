@@ -42,6 +42,18 @@ suffix, plus `.weight`, minus an optional prefix.
 carry `lora_unet_`. A loader that strips unconditionally finds zero pairs on the
 second kind. All three forms are accepted.
 
+**Flattened names resolve against the checkpoint, never by guessing.**
+Convention B spells the target with underscores, `blocks_24_attn_out_proj` for
+`blocks.24.attn.out_proj`, and where the dots go cannot be derived from the
+underscores: `attn_out_proj` is `attn.out_proj` but `mlp_fc1` is `mlp.fc1`. So
+the loader does not de-flatten. It looks the name up with a comparison that
+reads `.` and `_` as the same separator, over the checkpoint's own target names
+(`h3_weight_find_flattened`). Exact match is tried first, so convention A never
+leaves the path it has always taken. Two targets that flatten alike are
+ambiguous and match nothing; the reference checkpoint flattens its 266
+two-dimensional targets with zero collisions. Once resolved, the pair carries
+the checkpoint's dotted spelling, which is what a site matches on.
+
 **Rank is per pair, never per file.** The upstream turbo has rank 64 on the
 backbone and rank 16 on its AdaLN pairs. It is read from the shape of `A`
 (`[rank, in]`) and `B` (`[out, rank]`); if the two disagree the pair is

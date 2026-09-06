@@ -20,6 +20,15 @@ const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
                                    const char *name,
                                    const h3_st_header **header);
 
+/* Find the target whose name matches `flattened` once '.' and '_' are read as
+ * the same separator: the spelling a convention-B LoRA file writes, where
+ * blocks_0_attn_qkv_proj means blocks.0.attn.qkv_proj. The checkpoint's own
+ * names are the only source of the dots, so a name is resolved or it is not,
+ * and never guessed at. Two targets that flatten alike are ambiguous and match
+ * nothing; the reference checkpoint has no such pair. */
+const h3_st_tensor *h3_weight_find_flattened(const h3_weight_store *store,
+                                             const char *flattened);
+
 /* Validate an exact BF16 shape, allocate a shared Metal buffer, and read the
  * payload directly into that buffer with no intermediate host allocation. */
 h3_gpu_tensor *h3_weight_load_bf16(const h3_weight_store *store, h3_gpu *gpu,
