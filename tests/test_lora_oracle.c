@@ -64,15 +64,28 @@ enum { ROWS = 4, MAX_SOURCES = 2 };
  * of the two printed. The significance guard is the other half of the same
  * requirement: a delta too weak to move the output agrees with anything, so a
  * LoRA file swapped for a limp one has to fail instead of passing silently.
+ *
  * DEVIATION FROM THE ORIGINAL SPEC, on record. It asked for ten times the
- * tolerance, 3e-2, from a four-block sample. A sweep of all 50 blocks of the corpus turbo
- * file contradicts it: the weakest deltas are blocks 29, 8 and 2 at 1.326e-02,
- * 1.401e-02 and 1.428e-02, all of which agree with the oracle at 2.35e-03. Both
- * 3e-2 and 1.5e-2 therefore fail a correct implementation. 1.0e-2 sits below the
- * measured minimum with a 33% margin and still catches the case the guard exists
- * for: at strength 1 the delta drops to 4.71e-04, twenty times under this floor. */
+ * tolerance, 3e-2, from a four-block sample. Both numbers below come from a
+ * sweep of all 200 projections of the corpus turbo file, 50 blocks at strength
+ * 100, with both guards switched off so that no block stopped early.
+ *
+ * Tolerance: rel-L2 runs 2.275e-03 to 2.384e-03, median 2.343e-03. 3e-3 clears
+ * the worst projection by 20% and no projection exceeds it.
+ *
+ * Significance: the guard fires per projection, and the weakest projections are
+ * block 29 mlp.fc2 at 6.583e-03, block 8 mlp.fc2 at 6.584e-03 and block 39
+ * mlp.fc1 at 6.625e-03. mlp.fc2 is the weak family throughout, median 7.606e-03
+ * against 1.731e-02 for attn.qkv_proj. 4.4e-03 sits 33% below the measured
+ * minimum and still catches what the guard exists for: at strength 1 the delta
+ * falls to around 1e-04, an order of magnitude under this floor.
+ *
+ * An earlier revision of this comment recorded weakest deltas of 1.326e-02 and
+ * set the floor at 1.0e-2. Those are per-block figures, and the guard is per
+ * projection: at 1.0e-2 a correct implementation fails on most blocks, block 0
+ * included. Anyone re-measuring should keep the two apart. */
 static const double T1_TOLERANCE = 3e-3;
-static const double T1_MIN_DELTA_SHARE = 1.0e-2;
+static const double T1_MIN_DELTA_SHARE = 4.4e-03;
 
 /* Per-half amplitude of the synthetic AdaLN pair, on top of the 1/sqrt(fan-in)
  * that keeps the two GEMMs in scale. The corpus design leaves the amplitude
@@ -84,6 +97,17 @@ static const double T1_MIN_DELTA_SHARE = 1.0e-2;
  * strength 100: delta share 4,08e-02, against 1,67e-02 to 4,96e-02 for the four
  * real pairs of the turbo file. */
 #define SYNTHETIC_AMPLITUDE 0.1f
+
+/* The amplitude is calibrated at strength 100, but a file whose own pairs are
+ * strong has to run at a much lower one: mystic saturates the output at 100 and
+ * is measured at 3. The delta scales as strength times the square of the
+ * amplitude, so the amplitude carries 1/sqrt(strength) and the synthetic pair
+ * lands in the same regime whatever strength the run uses. Without it the
+ * synthetic AdaLN delta sinks under the significance floor at low strength and
+ * the run fails for the harness's reason instead of the code's. */
+static float synthetic_amplitude(float strength) {
+    return SYNTHETIC_AMPLITUDE * sqrtf(100.0f / strength);
+}
 
 /* `synthetic_rank` is 0 for a target whose pair is read from the LoRA file.
  * The AdaLN target has no pair in either corpus file (the pruned converter
@@ -212,13 +236,13 @@ static float *read_pair_f32(const h3_st_header *header,
 
 /* One half of a synthetic pair, scaled so the delta lands in the regime the
  * real pairs occupy instead of drowning the base output: 1/sqrt(fan-in) on
- * each of the two GEMMs, times SYNTHETIC_AMPLITUDE. The measured delta share
- * is printed with the errors and guarded below, so the choice is visible
- * rather than assumed. */
+ * each of the two GEMMs, times the strength-corrected amplitude above. The
+ * measured delta share is printed with the errors and guarded below, so the
+ * choice is visible rather than assumed. */
 static uint16_t *synthetic_half(size_t count, size_t fan_in, uint64_t seed,
-                                const char *what) {
+                                float amplitude, const char *what) {
     uint16_t *values = checked_malloc(count * sizeof(*values), what);
-    float scale = SYNTHETIC_AMPLITUDE / sqrtf((float)fan_in);
+    float scale = amplitude / sqrtf((float)fan_in);
     for (size_t index = 0; index < count; index++)
         values[index] = f32_to_bf16(next_activation(&seed) * scale);
     return values;
@@ -463,8 +487,18 @@ int main(int argc, char **argv) {
          * looked at. The AdaLN target is the exception the corpus design settles: no
          * corpus file carries its pair, so it is synthesised at the upstream
          * shapes and measured against the same real W. */
-        int synthetic = missing == sources && PROJECTIONS[which].synthetic_rank;
-        if (missing && !synthetic) {
+        int synthetic[MAX_SOURCES] = {0};
+        size_t real_sources = 0;
+        for (size_t source = 0; source < sources; source++) {
+            synthetic[source] = !pair[source] &&
+                                PROJECTIONS[which].synthetic_rank != 0;
+            if (!synthetic[source]) real_sources++;
+        }
+        /* Adapters may disagree about a target: turbo carries AdaLN pairs and
+         * the style files do not, which is exactly the set a real run mixes.
+         * Each one is therefore decided on its own, and only a projection with
+         * no synthetic fallback at all is fatal. */
+        if (missing && !PROJECTIONS[which].synthetic_rank) {
             fprintf(stderr, "FAIL tests/test_lora_oracle.c: %s has no "
                     "pair for %s; a whole-block oracle needs all four "
                     "projections in one pass\n",
@@ -476,15 +510,17 @@ int main(int argc, char **argv) {
         float pair_scale[MAX_SOURCES];
         uint16_t *a_bf16[MAX_SOURCES], *b_bf16[MAX_SOURCES];
         for (size_t source = 0; source < sources; source++) {
-            if (synthetic) {
+            if (synthetic[source]) {
                 rank[source] = PROJECTIONS[which].synthetic_rank;
                 pair_scale[source] = 1.0f;
                 uint64_t seed = 0x5a1e0000ull + which * 16 + source;
+                float amplitude = synthetic_amplitude(strength);
                 a_bf16[source] = synthetic_half(rank[source] * input_dim,
-                                                input_dim, seed,
+                                                input_dim, seed, amplitude,
                                                 "synthetic lora A");
                 b_bf16[source] = synthetic_half(output_dim * rank[source],
                                                 rank[source], seed + 0x1000ull,
+                                                amplitude,
                                                 "synthetic lora B");
                 printf("  %-17s adapter %zu: synthetic pair, A[%zu,%zu] "
                        "B[%zu,%zu]\n", projection, source + 1, rank[source],
@@ -506,7 +542,7 @@ int main(int argc, char **argv) {
         uint16_t *w_bf16 = read_bf16_tensor(shard, w_tensor, "base weight");
         const float *a_f32[MAX_SOURCES], *b_f32[MAX_SOURCES];
         for (size_t source = 0; source < sources; source++) {
-            if (synthetic) {
+            if (synthetic[source]) {
                 a_f32[source] = expand_bf16(a_bf16[source],
                                             rank[source] * input_dim, 1.0f,
                                             "lora A f32");
@@ -552,8 +588,21 @@ int main(int argc, char **argv) {
         h3_gpu_tensor *lora_a[MAX_SOURCES], *lora_a0[MAX_SOURCES];
         h3_gpu_tensor *lora_b[MAX_SOURCES];
         uint32_t ranks32[MAX_SOURCES];
-        if (synthetic) {
-            for (size_t source = 0; source < sources; source++) {
+        if (real_sources) {
+            if (!h3_lora_site_build(&set, gpu, pair_name, &site, error,
+                                    sizeof(error)) ||
+                !h3_lora_site_build(&zero_set, gpu, pair_name, &zero_site,
+                                    error, sizeof(error))) die(error);
+            /* One branch per adapter that carries this pair, and no more: an
+             * adapter that is missing it contributes a synthetic branch below
+             * instead. A shortfall against that count is the missing graft
+             * T1b exists to catch. */
+            if (site.count != real_sources || zero_site.count != real_sources)
+                die("h3_lora_site_build gave the target fewer branches than "
+                    "the active set has adapters for it");
+        }
+        for (size_t source = 0, branch = 0; source < sources; source++) {
+            if (synthetic[source]) {
                 uint16_t *a_fused = fuse_scale(a_bf16[source],
                                                rank[source] * input_dim,
                                                strength, "fused lora A");
@@ -571,20 +620,12 @@ int main(int argc, char **argv) {
                 free(a_fused);
                 if (!lora_a[source] || !lora_a0[source] || !lora_b[source])
                     die("cannot upload weights");
-            }
-        } else {
-            if (!h3_lora_site_build(&set, gpu, pair_name, &site, error,
-                                    sizeof(error)) ||
-                !h3_lora_site_build(&zero_set, gpu, pair_name, &zero_site,
-                                    error, sizeof(error))) die(error);
-            if (site.count != sources || zero_site.count != sources)
-                die("h3_lora_site_build gave the target fewer branches than "
-                    "the active set has adapters");
-            for (size_t source = 0; source < sources; source++) {
-                lora_a[source] = site.branches[source].a;
-                lora_b[source] = site.branches[source].b;
-                lora_a0[source] = zero_site.branches[source].a;
-                ranks32[source] = site.branches[source].rank;
+            } else {
+                lora_a[source] = site.branches[branch].a;
+                lora_b[source] = site.branches[branch].b;
+                lora_a0[source] = zero_site.branches[branch].a;
+                ranks32[source] = site.branches[branch].rank;
+                branch++;
                 if (ranks32[source] != (uint32_t)rank[source])
                     die("the materialised branch disagrees with its pair's "
                         "rank");
@@ -654,7 +695,9 @@ int main(int argc, char **argv) {
         free(got_rounded);
         free(got);
         for (size_t source = 0; source < sources; source++) {
-            if (synthetic) {
+            /* Only the synthetic branches are ours to free; the rest belong to
+             * the two sites, released just below. */
+            if (synthetic[source]) {
                 h3_gpu_tensor_free(lora_b[source]);
                 h3_gpu_tensor_free(lora_a0[source]);
                 h3_gpu_tensor_free(lora_a[source]);
