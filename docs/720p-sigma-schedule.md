@@ -27,16 +27,21 @@ off-trajectory. It does not apply: the 544p/768p split is lightx2v's naming,
 and our file comes from a repository that publishes no resolution variants at
 all. Section 7 has the repository listing that settles it.
 
-Three things worth carrying away beyond the verdict:
+Four things worth carrying away beyond the verdict:
 
+- **Section 5**: how many steps is enough is a property of the **content**, not
+  of the model. The two ladders in this repo disagree because their prompts sit
+  at opposite ends of one axis: a near-static portrait is satisfied at 4, while
+  a riffle shuffle keeps improving to at least 8.
+- **Section 5** also: this file ships no `.alpha` tensors, so `strength 1.0`
+  means something 16x larger here than in a lightx2v file at the same nominal
+  strength.
+- **Section 8**: `--reuse` does not rebuild the sigma grid. `--steps 20
+  --reuse 2` walks the 20-step grid at 11 evaluations, not an 11-step grid, and
+  a measured pair at equal cost shows how much that matters.
 - **Section 7** also documents the two shift accessors added while chasing that
   scare. They stay, because they closed a real latent desync between the video
   grid and the audio slope correction.
-- **Section 8**: `--reuse` does not rebuild the sigma grid. `--steps 20
-  --reuse 2` walks the 20-step grid at 11 evaluations, not an 11-step grid.
-- **Section 5**: this file ships no `.alpha` tensors, so `strength 1.0` means
-  something 16x larger here than in a lightx2v file at the same nominal
-  strength.
 
 ---
 
@@ -316,20 +321,65 @@ useful range", but what he actually ships a workflow for is 6. The useful
 takeaway is that `--steps 4` is the **floor** of the author's range rather than
 its centre, and the file name is not a recommendation.
 
-**This does not match our own measurement, and the disagreement should not be
-smoothed over.** `docs/720p-schedule-ladder.md` ran exactly this comparison at
-640x352 / 124 frames with this LoRA and found the opposite: R2 (`--steps 6`)
-"buys nothing over" R1 (`--steps 4`) and adds a faint concentric ring to the
-backdrop that R1 does not have, so it recommends 4. And 8 steps has **never
-been measured here** at all: rung R3 (`--steps 8 --reuse 2`) was started and
-killed before completion, and no output or log from it was kept.
+**Six is a general-purpose default, not a contradiction of the filename.** That
+reading only becomes available once you put the two ladders in this repo side
+by side, because they disagree, and they disagree for a reason.
 
-So the evidence splits: the author ships a 6-step workflow, our one measurement
-prefers 4, and nobody here has data on 8. Since section 8 shows that only
-`--reuse 1` keeps a run on the distilled grid, and the ladder's R1 and R2 both
-used `--reuse 1`, the comparison was at least made on comparable footing. If a
-future run wants to revisit the step count, R3 is the missing rung and the
-cheap canvas is where to run it.
+### How many steps is enough is a property of the content
+
+Two ladders have been run here with this LoRA, both at 640x352 / 124 frames,
+both with `--reuse 1`, on two prompts chosen to sit at opposite ends of one
+axis.
+
+**`docs/720p-schedule-ladder.md`**, on `prompts/01-breath.txt`: a locked-off
+medium close-up, one subject, one breath, a blink, an earring sway. It found
+R2 (`--steps 6`) "buys nothing over" R1 (`--steps 4`) and adds a faint
+concentric ring to the backdrop, so it recommends 4. Its own author flagged the
+limit of that result in the document: the prompt is nearly static, the easiest
+possible case for temporal coherence, and it explicitly asked for a re-test on
+a motion-heavy prompt before the finding was treated as settled.
+
+**`docs/720p-schedule-ladder-2.md`**, on `prompts/06-hands.txt`: a magician's
+riffle shuffle. Fast subject motion plus the hardest structural subject there
+is, fingers and joints. It is the re-test the first ladder asked for, and it
+found the opposite, with quality still climbing at 8:
+
+| evaluations | what the contact sheet shows |
+|--:|---|
+| 4 | Hands and deck correct, shuffle progresses. Skin waxy and smooth; card faces are red and yellow smears with no structure. |
+| 6 | Skin texture returns, knuckle creases and pores visible. Cards become structured blue backs with distinguishable edges, but no readable faces. |
+| 8 | Card faces legible: a red diamonds card with countable pips, a court card with recognisable gold face artwork. A white shirt cuff resolves as fabric. Deck edges crisp. |
+
+**Neither supersedes the other. The step count that is enough is a function of
+what the content demands.** A slow portrait is satisfied at 4; content with
+fine structure and fast motion keeps improving to at least 8. That also
+reconciles the vendor page, which says 4 suits "static shots, slow pans,
+talking-head framing" and that "the first thing to break is large or fast
+motion". Both ladders are instances of that one rule, taken from opposite
+sides. And it is why the author shipping a 6-step workflow for a file named
+`4step` is not him contradicting himself: 4 is the minimum his distillation
+supports, 6 is a sane default for content he cannot see in advance.
+
+Cost, from `logs/lad2-M1.log` and `logs/lad2-M2.log`: 477.083 s over 6
+evaluations and 635.545 s over 8, which is 79.5 and 79.4 s per evaluation.
+Flat per evaluation, as expected, so the step count buys quality at a linear
+price.
+
+**What is not measured.** Ten steps on the second ladder is unmeasured:
+`logs/lad2-M3.log` shows a completed denoise (975.729 s over 10 evaluations)
+and `outputs/lad2-M3.mp4` exists, but no contact sheet was produced and the
+rung is being re-run, so there is no quality reading at 10. On the first
+ladder, rung R3 (`--steps 8 --reuse 2`) was started and killed, with no output
+or log kept. Neither gap is filled by the other ladder, because they are
+different prompts.
+
+**Provenance note.** At the time of writing,
+`docs/720p-schedule-ladder-2.md` **has not been committed to any branch**. It
+is landing on `feat/720p-blocked-attention`. The contact sheets and logs cited
+above are present in the working tree (`outputs/lad2-*-contact.png`,
+`logs/lad2-*.log`) and the numbers here were read from those logs directly. If
+the document is not where this section says it is, that is why; look for the
+artifacts instead.
 
 What is **not** published for this file is the distillation itself: no training
 config, no yaml or json recording the sigma schedule or timestep sampling,
@@ -566,6 +616,39 @@ Two consequences worth carrying into any future experiment on this repo:
 quality grounds, so the shipping configuration is correct. It is correct for a
 second reason that was not known when it was chosen.
 
+### Measured: same evaluation count, very different video
+
+Everything above is read off the code. The second ladder happens to contain the
+controlled pair that tests it, which nothing has written up:
+
+| run | flags | evaluations | grid walked |
+|---|---|--:|---|
+| `lad2-L1` | `--steps 4 --reuse 1` | 4 | 4-step, every point evaluated |
+| `lad2-L2` | `--steps 8 --reuse 2` | 4 | 8-step, 4 of 8 evaluated, rest extrapolated |
+
+Both cost 4 denoiser evaluations (`attention=200` in both profiles, and
+`logs/lad2-L2.log` says "selected reuse schedule has 4 evaluations"), and their
+denoise wall times agree to 6%: 336.1 s and 317.8 s.
+
+**The video is not remotely comparable.** `outputs/lad2-L1-contact.png` shows
+correct hands and deck with a progressing shuffle. `outputs/lad2-L2-contact.png`
+shows heavy smearing across all four frames, duplicated and ghosted
+fingernails, a deck that has lost its card structure, and pronounced cyan and
+magenta chromatic fringing that worsens through the clip until the final frame
+has broken down structurally. At identical cost.
+
+So evaluation count does not determine quality, which is the practical form of
+this section's claim. Two mechanisms are confounded in that pair and this
+result does not separate them: `--reuse 2` both moves the run onto a different
+sigma grid *and* extrapolates the velocity at the skipped steps, and the
+extrapolation error is very likely the larger term. Isolating them would need a
+run that walks the 8-step grid while evaluating every point, which is just
+`--steps 8 --reuse 1`, and that is `lad2-M2`, whose sheet is clean. Read
+together, the three suggest the damage is extrapolation rather than the grid.
+
+This is the measured backing for `README:518`'s "with very small step counts,
+keep `--reuse 1`", which until now was an assertion without a picture attached.
+
 Sideways corroboration, offered as an observation and not as proof: the ladder
 found that R2 (`--steps 6 --reuse 1`) bought no visible improvement over R1
 (`--steps 4`) and added a faint concentric ring in the flat backdrop. 6 steps
@@ -640,8 +723,14 @@ Repo, read at `main`:
 - `MiniMax-H3/FL2VA/model_index.json` `sigma_shift_scales`
 - `loras/turbo.safetensors` safetensors header (518 tensors, no `.alpha`)
 - `h3_lora.c:396-410` alpha handling, `h3_lora.c:905` the final multiplier
-- `docs/720p-schedule-ladder.md` the 4-against-6 measurement, and that 8 was
-  never completed
+- `docs/720p-schedule-ladder.md` the 4-against-6 measurement on
+  `prompts/01-breath.txt`, and that its R3 rung was never completed
+- `docs/720p-schedule-ladder-2.md` the 4/6/8 measurement on
+  `prompts/06-hands.txt` (landing on `feat/720p-blocked-attention`; not
+  committed anywhere at the time of writing)
+- `logs/lad2-L1.log`, `lad2-L2.log`, `lad2-M1.log`, `lad2-M2.log`,
+  `lad2-M3.log` and `outputs/lad2-*-contact.png`, read directly for the
+  evaluation counts, wall times and the equal-cost pair in section 8
 
 External, read 2026-09-14:
 
