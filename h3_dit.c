@@ -216,7 +216,35 @@ struct h3_dit {
      * ceiling is a DiT nobody armed, and costs one comparison per run. */
     h3_memory_ceiling memory_ceiling;
     int memory_gate_done;
+    /* Crash resume. Path and key are owned; the state is borrowed and cleared
+     * as soon as the sampler has read it, so it cannot outlive the caller's
+     * copy when a prepared DiT is cached across generations. */
+    char *resume_path;
+    char *resume_key;
+    const h3_resume_state *resume_from;
 };
+
+int h3_dit_set_resume(h3_dit *dit, const char *path, const char *key,
+                      const h3_resume_state *state) {
+    if (!dit) return 0;
+    free(dit->resume_path);
+    free(dit->resume_key);
+    dit->resume_path = NULL;
+    dit->resume_key = NULL;
+    dit->resume_from = NULL;
+    if (!path || !key) return 1;
+    dit->resume_path = strdup(path);
+    dit->resume_key = strdup(key);
+    if (!dit->resume_path || !dit->resume_key) {
+        free(dit->resume_path);
+        free(dit->resume_key);
+        dit->resume_path = NULL;
+        dit->resume_key = NULL;
+        return 0;
+    }
+    dit->resume_from = state;
+    return 1;
+}
 
 void h3_dit_arm_memory_gate(h3_dit *dit, const h3_memory_ceiling *ceiling) {
     if (!dit || !ceiling) return;
@@ -3014,11 +3042,45 @@ int h3_dit_denoise_euler_preview(
         fail(error, error_size, "invalid Euler denoising arguments");
         return 0;
     }
-    if (gpu_sampler_requested(dit))
+    /* Consumed on entry, whichever sampler runs: the caller's state is only
+     * guaranteed to live across one denoise, and a prepared DiT can outlive it
+     * in the cache. */
+    const h3_resume_state *from = dit->resume_from;
+    dit->resume_from = NULL;
+    /* The one piece of sampler state that is NOT on the host at an evaluation
+     * boundary: with --core-reuse N the transformer core is skipped on
+     * evaluations that are not a multiple of N, and what stands in for it is
+     * dit->core_residual, a hidden-sized BF16 GPU buffer (~350 MiB at
+     * 1280x704/124) plus the evaluation counter whose phase selects it. A
+     * resume restarts that counter with no residual, so the first resumed
+     * evaluation computes a full core and the cycle lands on different steps
+     * from there on. Storing the residual would multiply the checkpoint by
+     * ten to save nothing, so the combination is refused instead of
+     * approximated. --core-reuse 1, the exact default, has no such state. */
+    if (dit->resume_path && dit->core_reuse_interval > 1) {
+        fail(error, error_size, "resume does not cover --core-reuse %u: the "
+             "cached core residual crosses evaluations in a GPU buffer, and "
+             "restarting its cycle would change the trajectory",
+             dit->core_reuse_interval);
+        return 0;
+    }
+    if (gpu_sampler_requested(dit)) {
+        /* The GPU sampler keeps the latents and the whole velocity history in
+         * device buffers, the history in BF16. Checkpointing it would mean
+         * reading back and rounding exactly the state a resume must restore
+         * exactly, so it is refused rather than approximated. The path is
+         * inert on anything but an M5 anyway. */
+        if (dit->resume_path) {
+            fail(error, error_size, "resume needs the host Euler sampler; the "
+                 "GPU sampler holds its velocity history in BF16 device "
+                 "buffers (unset H3_GPU_SAMPLER)");
+            return 0;
+        }
         return denoise_euler_gpu(dit, video_latent, audio_latent,
                                  reuse_interval, progress, progress_opaque,
                                  preview, preview_opaque,
                                  error, error_size);
+    }
     uint8_t selected[H3_MAX_STEPS] = {0};
     int selected_count = h3_dit_reuse_schedule(
         dit->sigmas.steps, reuse_interval, selected, sizeof(selected));
@@ -3061,7 +3123,27 @@ int h3_dit_denoise_euler_preview(
     int ok = 1;
     int last_evaluated = -1;
     int previous_evaluated = -1;
-    for (int step = 0; step < dit->sigmas.steps && ok; step++) {
+    int start_step = 0;
+    if (from) {
+        start_step = from->step;
+        last_evaluated = from->last_evaluated;
+        previous_evaluated = from->previous_evaluated;
+        /* The reuse setting is part of the checkpoint's identity, so these
+         * arrays exist on both sides or on neither. */
+        if (last_video && from->last_video) {
+            memcpy(last_video, from->last_video,
+                   video_count * sizeof(*last_video));
+            memcpy(last_audio, from->last_audio,
+                   audio_count * sizeof(*last_audio));
+        }
+        if (previous_video && from->previous_video) {
+            memcpy(previous_video, from->previous_video,
+                   video_count * sizeof(*previous_video));
+            memcpy(previous_audio, from->previous_audio,
+                   audio_count * sizeof(*previous_audio));
+        }
+    }
+    for (int step = start_step; step < dit->sigmas.steps && ok; step++) {
         report(progress, progress_opaque, "denoise", step, dit->sigmas.steps);
         int evaluate = selected[step];
         if (evaluate) {
@@ -3112,6 +3194,30 @@ int h3_dit_denoise_euler_preview(
             fail(error, error_size, "denoising preview stopped at step %d",
                  step + 1);
             ok = 0;
+        }
+        /* The Euler transition above has already moved both latents to their
+         * step+1 value, and nothing else in the loop carries state, so this is
+         * the seam. Reused steps are not checkpointed: they cost no evaluation
+         * and are redone from here for free. */
+        if (ok && dit->resume_path && evaluate) {
+            h3_resume_state save = {
+                .key = dit->resume_key,
+                .step = step + 1,
+                .steps = dit->sigmas.steps,
+                .last_evaluated = last_evaluated,
+                .previous_evaluated = previous_evaluated,
+                .video_elements = video_count,
+                .audio_elements = audio_count,
+                .video_latent = video_latent,
+                .audio_latent = audio_latent,
+                .last_video = last_evaluated >= 0 ? last_video : NULL,
+                .last_audio = last_evaluated >= 0 ? last_audio : NULL,
+                .previous_video = previous_evaluated >= 0
+                    ? previous_video : NULL,
+                .previous_audio = previous_evaluated >= 0
+                    ? previous_audio : NULL
+            };
+            ok = h3_resume_write(dit->resume_path, &save, error, error_size);
         }
         if (ok) report(progress, progress_opaque, "denoise", step + 1,
                        dit->sigmas.steps);
@@ -3189,6 +3295,8 @@ void h3_dit_free(h3_dit *dit) {
     FREE(audio_output_bf16); FREE(video_output_bf16);
     FREE(previous_audio_velocity); FREE(previous_video_velocity);
 #undef FREE
+    free(dit->resume_path);
+    free(dit->resume_key);
     h3_dit_schedule_free(dit->schedule);
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);

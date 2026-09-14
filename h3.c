@@ -6,6 +6,7 @@
 #include "h3_lora.h"
 #include "h3_metal.h"
 #include "h3_multimodal.h"
+#include "h3_resume.h"
 #include "h3_safetensors.h"
 #include "h3_text_encoder.h"
 #include "h3_tokenizer.h"
@@ -932,6 +933,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     char *conditioning_key = NULL;
     char *prepared_key = NULL;
     char *decoder_key = NULL;
+    char *resume_key = NULL;
+    h3_resume_state resume;
+    memset(&resume, 0, sizeof(resume));
+    int resuming = 0;
     int conditioning_hit = 0;
     int conditioned = 0;
     int dit_is_cached = 0;
@@ -1602,13 +1607,52 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory allocating joint H3 noise");
         goto cleanup;
     }
+    if (params->resume_path && *params->resume_path) {
+        /* The prepared-DiT key is already this run's identity for everything
+         * baked into the model, down to the prompt and the adapters with
+         * their strengths; the seed and the two reuse controls are what it
+         * does not cover. */
+        resume_key = h3_resume_key(prepared_key, params->seed,
+                                   params->denoise_reuse,
+                                   getenv("H3_REUSE_STEPS"));
+        struct stat resume_status;
+        if (!resume_key) {
+            h3_set_error(ctx, "out of memory building the resume identity");
+            goto cleanup;
+        }
+        if (stat(params->resume_path, &resume_status) == 0) {
+            if (!h3_resume_read(params->resume_path, resume_key, video_count,
+                                audio_count, &resume, detail,
+                                sizeof(detail))) {
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
+            resuming = 1;
+            memcpy(video, resume.video_latent,
+                   video_count * sizeof(*video));
+            memcpy(audio, resume.audio_latent,
+                   audio_count * sizeof(*audio));
+            fprintf(stderr, "h3: resuming %s at step %d of %d\n",
+                    params->resume_path, resume.step, resume.steps);
+        }
+        if (!h3_dit_set_resume(dit, params->resume_path, resume_key,
+                               resuming ? &resume : NULL)) {
+            h3_set_error(ctx, "out of memory arming the resume checkpoint");
+            goto cleanup;
+        }
+    } else if (!h3_dit_set_resume(dit, NULL, NULL, NULL)) {
+        h3_set_error(ctx, "cannot disarm the resume checkpoint");
+        goto cleanup;
+    }
     /* The released server initializes each modality from a separate generator
      * carrying the same requested seed. */
-    h3_rng video_rng, audio_rng;
-    h3_rng_seed(&video_rng, params->seed);
-    h3_rng_seed(&audio_rng, params->seed);
-    h3_rng_fill_normal(&video_rng, video, video_count);
-    h3_rng_fill_normal(&audio_rng, audio, audio_count);
+    if (!resuming) {
+        h3_rng video_rng, audio_rng;
+        h3_rng_seed(&video_rng, params->seed);
+        h3_rng_seed(&audio_rng, params->seed);
+        h3_rng_fill_normal(&video_rng, video, video_count);
+        h3_rng_fill_normal(&audio_rng, audio, audio_count);
+    }
     if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,
@@ -1730,6 +1774,8 @@ cleanup:
     free(conditioning_key);
     free(prepared_key);
     free(decoder_key);
+    free(resume_key);
+    h3_resume_release(&resume);
     free(tokenizer_path); free(text_path); free(dit_path); free(vae_path);
     free(audio_vae_path);
     h3_tokenizer_free(tokenizer);

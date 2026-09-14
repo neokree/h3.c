@@ -49,6 +49,9 @@ static void usage(const char *program) {
         "      --seed N           Random seed (default: 42)\n"
         "      --first-frame PATH First-frame conditioning image\n"
         "      --last-frame PATH  Last-frame conditioning image\n"
+        "      --resume PATH      Checkpoint the denoise to PATH after every\n"
+        "                         evaluation and continue from it if it holds\n"
+        "                         this same run (delete it to start over)\n"
         "      --lora PATH[:STRENGTH]  Apply a LoRA adapter (default 1.0,\n"
         "                         repeatable)\n"
         "      --ref-image PATH    Append an ordered Ref2VA image\n"
@@ -278,7 +281,7 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_LORA, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_PROFILE, OPT_INFO };
+           OPT_RESUME, OPT_PROFILE, OPT_INFO };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -327,6 +330,7 @@ int main(int argc, char **argv) {
         {"ref-video-audio", required_argument, NULL, OPT_REF_VIDEO_AUDIO},
         {"ref-audio", required_argument, NULL, OPT_REF_AUDIO},
         {"lora", required_argument, NULL, OPT_LORA},
+        {"resume", required_argument, NULL, OPT_RESUME},
         {"frames-dir", required_argument, NULL, OPT_FRAMES_DIR},
         {"show", no_argument, NULL, OPT_SHOW},
         {"zoom", required_argument, NULL, OPT_ZOOM},
@@ -486,6 +490,7 @@ int main(int argc, char **argv) {
                 reference->path = optarg;
                 break;
             }
+            case OPT_RESUME: params.resume_path = optarg; break;
             case OPT_LORA: parse_lora(optarg, &loras[lora_count++]); break;
             case OPT_FRAMES_DIR: cli.frames_dir = optarg; break;
             case OPT_SHOW: show = 1; break;

@@ -4,6 +4,7 @@
 #include "h3_gpu.h"
 #include "h3_host.h"
 #include "h3_lora.h"
+#include "h3_resume.h"
 #include "h3_text_encoder.h"
 
 #include <stddef.h>
@@ -88,6 +89,15 @@ int h3_dit_reset_run(h3_dit *dit,
                      const float *condition_audio_rows,
                      size_t condition_audio_elements,
                      char *error, size_t error_size);
+
+/* Arm crash-resume checkpointing on the host Euler sampler: after every
+ * denoiser evaluation the run's state is written to `path`, overwriting it.
+ * `state` resumes a previous run and may be NULL to start from step 0; it is
+ * borrowed, and consumed by the first denoise that follows. Passing a NULL
+ * path disarms, which a cached prepared DiT needs between generations.
+ * Returns 0 only on allocation failure. */
+int h3_dit_set_resume(h3_dit *dit, const char *path, const char *key,
+                      const h3_resume_state *state);
 
 size_t h3_dit_video_elements(const h3_dit *dit);
 size_t h3_dit_audio_elements(const h3_dit *dit);
