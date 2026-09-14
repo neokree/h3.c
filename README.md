@@ -562,6 +562,20 @@ canvas. `--core-reuse` above 1 is refused, because the cached transformer
 residual it carries between evaluations lives in a GPU buffer that a resume
 cannot restore.
 
+Resume cannot be validated by comparing a resumed run byte-for-byte against an
+uninterrupted one, because two uninterrupted runs of the same command do not
+agree either. Measured at `448x576`, 22 frames, 20 steps, `--reuse 2`, one run
+SIGKILLed at step 9 and resumed twice: the restored velocity history is exactly
+the bytes that were written (0 of 169344 floats differ), and the resumed sampler
+reports the schedule position it should, `step 9/20 at video sigma 0.93617022,
+audio sigma 0.785714388, last evaluated 8, previous 6`. What differs afterwards
+is the pipeline's own cross-process variation, and it is the same size with or
+without a resume: two uninterrupted runs differed by rel-L2 0.176 in the final
+video latent (27.4 dB PSNR), while resumed against uninterrupted differed by
+0.109 and 0.139 (30.2 and 29.9 dB). Some pairs of uninterrupted runs are instead
+bit-identical, so the variation is a discrete per-process choice rather than
+per-operation float noise.
+
 ### Exact DiT fusions
 
 Every active DiT block fuses its attention residual gate with the following MLP

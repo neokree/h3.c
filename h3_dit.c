@@ -3128,6 +3128,16 @@ int h3_dit_denoise_euler_preview(
         start_step = from->step;
         last_evaluated = from->last_evaluated;
         previous_evaluated = from->previous_evaluated;
+        /* The schedule position is the field that is silently wrong when it is
+         * wrong, so it is printed rather than trusted: at the sigma pair below
+         * the latent's noise level either matches what the model is told or
+         * the output is garbage. */
+        fprintf(stderr, "h3: resume enters step %d/%d at video sigma %.9g, "
+                "audio sigma %.9g, last evaluated %d, previous %d\n",
+                start_step, dit->sigmas.steps,
+                (double)dit->sigmas.video[start_step],
+                (double)dit->sigmas.audio[start_step],
+                last_evaluated, previous_evaluated);
         /* The reuse setting is part of the checkpoint's identity, so these
          * arrays exist on both sides or on neither. */
         if (last_video && from->last_video) {
