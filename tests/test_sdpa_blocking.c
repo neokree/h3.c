@@ -168,6 +168,77 @@ static size_t sample_rows(uint32_t *rows, size_t capacity) {
     return used;
 }
 
+/* Is one SDPA encode bit-reproducible against itself?
+ *
+ * Two identical ./h3 invocations at a large canvas do not produce identical
+ * bytes (docs/720p-blocked-attention.md). The standing hypothesis is that
+ * MPSGraph's SDPA is the only GPU op in the pipeline whose reduction dimension
+ * scales with canvas and frame count - every other reduction contracts over a
+ * fixed model dimension - and that above N ~ 9,000 the key-axis reduction is
+ * split across units whose completion order, and so whose float summation
+ * order, is not guaranteed. Query blocking narrows the score tensor but always
+ * feeds K and V whole, so it does not touch the key-axis reduction: the
+ * hypothesis predicts blocked and whole-sequence alike are non-reproducible.
+ *
+ * This reports and does not assert. Nobody has established that MPSGraph
+ * promises bit-reproducibility, and a test that fails for a reason we cannot
+ * name is worse than a number nobody has yet explained. Two outcomes are
+ * informative: both paths differing confirms the key-axis account, and blocking
+ * restoring determinism refutes it and moves the diagnosis somewhere else. */
+static void determinism_case(h3_gpu *gpu, uint32_t sequence, uint32_t heads,
+                             const uint32_t *sizes, size_t variants) {
+    const size_t count = (size_t)sequence * heads * HEAD_DIM;
+    uint16_t *host = malloc(count * 3 * sizeof(*host));
+    uint16_t *first = malloc(count * sizeof(*first));
+    uint16_t *second = malloc(count * sizeof(*second));
+    h3_gpu_tensor *query = NULL, *key = NULL, *value = NULL;
+    if (!host || !first || !second) {
+        fprintf(stderr, "FAIL tests/test_sdpa_blocking.c: out of memory at "
+                "N=%u\n", sequence);
+        failures++;
+        goto done;
+    }
+    for (size_t i = 0; i < count * 3; i++) host[i] = next_bf16();
+    query = h3_gpu_tensor_from_bf16(gpu, host, count);
+    key = h3_gpu_tensor_from_bf16(gpu, host + count, count);
+    value = h3_gpu_tensor_from_bf16(gpu, host + count * 2, count);
+    if (!query || !key || !value) {
+        fprintf(stderr, "FAIL tests/test_sdpa_blocking.c: %s\n",
+                h3_gpu_error(gpu));
+        failures++;
+        goto done;
+    }
+    for (size_t i = 0; i < variants; i++) {
+        char path[32];
+        if (sizes[i]) snprintf(path, sizeof(path), "blocked %u", sizes[i]);
+        else snprintf(path, sizeof(path), "whole-sequence");
+        /* The inputs are the same device tensors, untouched between the two
+         * encodes, so anything that differs came out of the kernel. */
+        if (!encode(gpu, sizes[i], query, key, value, sequence, heads, first) ||
+            !encode(gpu, sizes[i], query, key, value, sequence, heads,
+                    second)) {
+            failures++;
+            break;
+        }
+        size_t differing = 0;
+        for (size_t e = 0; e < count; e++)
+            if (first[e] != second[e]) differing++;
+        printf("determinism N=%-6u %-15s: %-16s %zu of %zu elements differ "
+               "(scores %.2f GiB)\n", sequence, path,
+               differing ? "NOT reproducible," : "bit-reproducible,",
+               differing, count,
+               (double)((size_t)(sizes[i] ? sizes[i] : sequence) * sequence *
+                        heads * sizeof(uint16_t)) / (1024.0 * 1024.0 * 1024.0));
+    }
+done:
+    h3_gpu_tensor_free(query);
+    h3_gpu_tensor_free(key);
+    h3_gpu_tensor_free(value);
+    free(second);
+    free(first);
+    free(host);
+}
+
 /* The alignment gate, from both sides. One head of 72 is a 144-byte query row,
  * so it can never be query-blocked however H3_SDPA_QUERY_BLOCK is set. Below
  * H3_SDPA_WHOLE_SEQUENCE_MAX the whole-sequence encode is still trustworthy and
@@ -432,11 +503,28 @@ int main(void) {
 
     alignment_gate(gpu);
 
+    /* One knob for both heavy cases, so they run in one session. The
+     * determinism shapes are gated with the oracle rather than left in
+     * `make test` because the above-threshold one is measured at the DiT's own
+     * 56 heads - the head count every published threshold was measured at - and
+     * a whole-sequence encode at N = 12,000 and 56 heads materialises a 16 GiB
+     * score tensor. */
     const char *want_target = getenv("H3_SDPA_TARGET");
-    if (want_target && *want_target && strcmp(want_target, "0"))
+    if (want_target && *want_target && strcmp(want_target, "0")) {
+        static const uint32_t both_paths[] = {0, 256};
+        static const uint32_t blocked_only[] = {256};
         target_case(gpu);
-    else
-        puts("skip: target N=33329 shape, set H3_SDPA_TARGET=1 (~6 GiB)");
+        putchar('\n');
+        /* 4,096 is below every threshold; 12,000 is above the accuracy collapse
+         * and still under the 2^33 score-element abort, so both paths encode
+         * there; 33,329 is production, where only the blocked path exists. */
+        determinism_case(gpu, 4096, TARGET_HEADS, both_paths, 2);
+        determinism_case(gpu, 12000, TARGET_HEADS, both_paths, 2);
+        determinism_case(gpu, TARGET_SEQUENCE, TARGET_HEADS, blocked_only, 1);
+    } else {
+        puts("skip: target N=33329 oracle and the determinism shapes, set "
+             "H3_SDPA_TARGET=1 (up to ~18 GiB)");
+    }
 
     h3_gpu_free(gpu);
     if (failures) return 1;
