@@ -516,6 +516,16 @@ always names the number of denoising passes, with terminal zero added after the
 last pass. Whole-denoiser reuse evaluates the first and last pass plus every
 requested interval, then extrapolates skipped video and audio velocities on
 their independent schedules. With very small step counts, keep `--reuse 1`.
+Reuse selects which passes are evaluated but never rebuilds the grid, so
+`--steps 20 --reuse 2` walks the 20-step schedule at 11 evaluations rather than
+an 11-step schedule.
+
+The released schedule's shifts, video 12 and audio 3, are the pair the
+checkpoint ships in `FL2VA/model_index.json`. `H3_VIDEO_SHIFT` and
+`H3_AUDIO_SHIFT` override them for measuring a turbo LoRA distilled on a
+different grid; a value outside `(0, 1000]` is refused rather than ignored, and
+every run names the shifts it used in its first log lines. See
+`docs/720p-sigma-schedule.md`.
 
 For the low-budget path, the released linear base grid won against
 actual-video-sigma linear spacing,

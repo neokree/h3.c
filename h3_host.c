@@ -126,6 +126,54 @@ double h3_time_shift_slope(double sigma, double from_shift, double to_shift) {
     return to_shift * a * a / (from_shift * b * b);
 }
 
+/* The sigma shifts default to the pair the checkpoint ships for itself in
+ * FL2VA/model_index.json ("sigma_shift_scales": video 12, audio 3), which is
+ * also what the released scheduler config and ComfyUI both use. H3_VIDEO_SHIFT
+ * and H3_AUDIO_SHIFT override them so a turbo LoRA distilled on a different
+ * grid can be measured against this one; 768p turbo checkpoints in this family
+ * are distilled at video shift 6. See docs/720p-sigma-schedule.md.
+ *
+ * Read through these two accessors and never off the macros, so video and
+ * audio can never come from different sources within one run.
+ * ponytail: two variables and a default, no shift-per-resolution table. */
+static double h3_sigma_shift(const char *name, const char *label,
+                             double fallback) {
+    const char *text = getenv(name);
+    double value = fallback;
+    if (text && *text) {
+        char *end = NULL;
+        double parsed = strtod(text, &end);
+        if (end == text || *end || !(parsed > 0.0) || parsed > 1000.0) {
+            fprintf(stderr, "h3: %s must be a number in (0, 1000], got \"%s\"; "
+                    "refusing to run rather than guess a sigma grid\n",
+                    name, text);
+            return 0.0;
+        }
+        value = parsed;
+    }
+    fprintf(stderr, "h3: %s sigma shift %g%s\n", label, value,
+            value == fallback ? " (default)"
+                              : " (OVERRIDDEN, non-default sigma grid)");
+    return value;
+}
+
+/* Zero means the environment asked for something invalid; callers refuse. */
+double h3_video_sigma_shift(void) {
+    static double cached = -1.0;
+    if (cached < 0.0)
+        cached = h3_sigma_shift("H3_VIDEO_SHIFT", "video",
+                                H3_VIDEO_SIGMA_SHIFT);
+    return cached;
+}
+
+double h3_audio_sigma_shift(void) {
+    static double cached = -1.0;
+    if (cached < 0.0)
+        cached = h3_sigma_shift("H3_AUDIO_SHIFT", "audio",
+                                H3_AUDIO_SIGMA_SHIFT);
+    return cached;
+}
+
 static float h3_shifted_sigma(int index, int steps, float shift) {
     int base_index = (index * 1000) / steps;
     float base = (float)(1000 - base_index) / 1000.0f;
@@ -134,13 +182,16 @@ static float h3_shifted_sigma(int index, int steps, float shift) {
 
 int h3_schedule_build(int steps, h3_sigma_schedule *schedule) {
     if (!schedule || steps < 1 || steps > H3_MAX_STEPS) return 0;
+    double video_shift = h3_video_sigma_shift();
+    double audio_shift = h3_audio_sigma_shift();
+    if (video_shift <= 0.0 || audio_shift <= 0.0) return 0;
     memset(schedule, 0, sizeof(*schedule));
     schedule->steps = steps;
     for (int index = 0; index < steps; index++) {
         schedule->video[index] = h3_shifted_sigma(
-            index, steps, (float)H3_VIDEO_SIGMA_SHIFT);
+            index, steps, (float)video_shift);
         schedule->audio[index] = h3_shifted_sigma(
-            index, steps, (float)H3_AUDIO_SIGMA_SHIFT);
+            index, steps, (float)audio_shift);
     }
     schedule->video[steps] = 0.0f;
     schedule->audio[steps] = 0.0f;
@@ -149,15 +200,18 @@ int h3_schedule_build(int steps, h3_sigma_schedule *schedule) {
 
 int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
+    float video_shift = (float)h3_video_sigma_shift();
+    float audio_shift = (float)h3_audio_sigma_shift();
+    if (video_shift <= 0.0f || audio_shift <= 0.0f) return 0;
     memset(schedule, 0, sizeof(*schedule));
     schedule->steps = evaluations;
     float denominator = (float)evaluations;
     for (int index = 0; index <= evaluations; index++) {
         float base = 1.0f - (float)index / denominator;
-        schedule->video[index] = (float)H3_VIDEO_SIGMA_SHIFT * base /
-            (1.0f + ((float)H3_VIDEO_SIGMA_SHIFT - 1.0f) * base);
-        schedule->audio[index] = (float)H3_AUDIO_SIGMA_SHIFT * base /
-            (1.0f + ((float)H3_AUDIO_SIGMA_SHIFT - 1.0f) * base);
+        schedule->video[index] = video_shift * base /
+            (1.0f + (video_shift - 1.0f) * base);
+        schedule->audio[index] = audio_shift * base /
+            (1.0f + (audio_shift - 1.0f) * base);
     }
     schedule->video[evaluations] = 0.0f;
     schedule->audio[evaluations] = 0.0f;
