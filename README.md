@@ -532,6 +532,50 @@ transformer time and unified-memory use. Core reuse holds the previous full
 transformer residual while refreshing the patch projection and timestep-aware
 head; it remains mutually exclusive with whole-velocity reuse.
 
+### Resuming an interrupted run
+
+`--resume PATH` checkpoints the denoise to one file after every denoiser
+evaluation, overwriting it, and continues from that file when it already holds
+the same run. It exists because a denoise can now run for an hour: a closed lid
+or a tripped memory guardrail should cost one evaluation, not all of them.
+
+```sh
+./h3 -d ./MiniMax-H3 -p "..." --width 1280 --height 704 --frames 124 \
+  --steps 6 --reuse 1 --ssd-streaming --resume outputs/run.h3resume \
+  -o outputs/run.mp4
+```
+
+Rerun the same command after an interruption and the denoise picks up at the
+evaluation the file names. The file carries both latents, the position in the
+sigma schedule, the velocity history whole-denoiser reuse extrapolates from,
+and the run's identity: canvas, frames, steps, layers, seed, reuse, the prompt
+and the adapters with their strengths. A checkpoint from a different run is
+refused and names the field that differs, so a mistyped flag stops the run
+instead of continuing into the wrong configuration. Delete the file to start a
+new run. It is written next to itself and renamed into place, so an
+interruption during the write costs the new checkpoint rather than the one
+already on disk.
+
+It weighs what the latents weigh: 12 MiB at 1280x704 with 124 frames at
+`--reuse 1`, 36 MiB with velocity history, against 579 s per evaluation at that
+canvas. `--core-reuse` above 1 is refused, because the cached transformer
+residual it carries between evaluations lives in a GPU buffer that a resume
+cannot restore.
+
+Resume cannot be validated by comparing a resumed run byte-for-byte against an
+uninterrupted one, because two uninterrupted runs of the same command do not
+agree either. Measured at `448x576`, 22 frames, 20 steps, `--reuse 2`, one run
+SIGKILLed at step 9 and resumed twice: the restored velocity history is exactly
+the bytes that were written (0 of 169344 floats differ), and the resumed sampler
+reports the schedule position it should, `step 9/20 at video sigma 0.93617022,
+audio sigma 0.785714388, last evaluated 8, previous 6`. What differs afterwards
+is the pipeline's own cross-process variation, and it is the same size with or
+without a resume: two uninterrupted runs differed by rel-L2 0.176 in the final
+video latent (27.4 dB PSNR), while resumed against uninterrupted differed by
+0.109 and 0.139 (30.2 and 29.9 dB). Some pairs of uninterrupted runs are instead
+bit-identical, so the variation is a discrete per-process choice rather than
+per-operation float noise.
+
 ### Exact DiT fusions
 
 Every active DiT block fuses its attention residual gate with the following MLP

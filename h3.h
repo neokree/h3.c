@@ -135,6 +135,11 @@ typedef struct {
     int use_slower_grouped_quantizer;
     /* Decode and deliver one representative frame after every Euler step. */
     int preview_denoise;
+    /* Checkpoint the denoise into this one file after every denoiser
+     * evaluation, overwriting it, and resume from it when it already holds
+     * this same run. A checkpoint from a different run is refused, naming the
+     * field that differs. */
+    const char *resume_path;
     /* Adapters requested for this generation, in the order they were given.
      * Entries at strength 0 are dropped while the active set is built. */
     const h3_lora *loras;
@@ -149,7 +154,7 @@ typedef struct {
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
-    NULL, 0, NULL, NULL, NULL, NULL \
+    NULL, NULL, 0, NULL, NULL, NULL, NULL \
 }
 
 typedef struct {
