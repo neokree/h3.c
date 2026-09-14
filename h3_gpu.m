@@ -1461,6 +1461,21 @@ int h3_gpu_qkv_rope_f32(h3_gpu *opaque, h3_gpu_tensor *query,
 /* Query-block size for the blocked SDPA loop below. An environment knob rather
  * than a CLI flag: it is a sweep knob, not a user control. 0 turns blocking
  * off and restores the single whole-sequence encode. */
+/* The longest sequence at which MPSGraph's whole-sequence
+ * scaledDotProductAttention still returns what the hardware can produce, at 56
+ * heads. Measured, docs/720p-blocked-attention.md: at N = 8,800 whole and
+ * blocked are bit-identical and both sit at the bf16 floor; by N = 9,100 the
+ * whole-sequence error is 3.0e-2, fifteen times the floor, and at a real canvas
+ * the frame is checkerboard noise with no subject; past 2^33 score elements,
+ * N ~ 12,370 at 56 heads, it aborts outright. 8,800 is the conservative end of
+ * that band: the last N measured good, not the first measured bad.
+ *
+ * ponytail: one number for every head count, measured at 56. The real boundary
+ * is a score-tensor size, so a caller with fewer heads is refused earlier than
+ * it strictly must be. Measure per head count only if something is ever refused
+ * for real - today nothing can be, all four callers are 256-byte aligned. */
+enum { H3_SDPA_WHOLE_SEQUENCE_MAX = 8800 };
+
 static uint32_t h3_gpu_sdpa_query_block(void) {
     const char *value = getenv("H3_SDPA_QUERY_BLOCK");
     if (!value || !*value) return 256;
@@ -1595,8 +1610,28 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
                   tensor_dtype == H3_GPU_BF16 ? sizeof(uint16_t) : 1;
     size_t row_bytes = (size_t)heads * head_dim * item;
     uint32_t block = h3_gpu_sdpa_query_block();
-    int blocked = block && block < sequence && batch == 1 && !causal &&
-                  !headMajor && !outputHeadMajor && row_bytes % 256 == 0;
+    /* Every other reason to skip blocking is a deliberate one: causal builds an
+     * [1,1,N,N] mask, a head-major block is not a contiguous byte range, and
+     * H3_SDPA_QUERY_BLOCK=0 is the documented escape hatch. Alignment is not
+     * deliberate - it falls out of the caller's head shape - so it is the one
+     * that gets refused instead of silently absorbed. Falling back used to cost
+     * nothing; now it means handing back the degraded kernel's output, which
+     * above H3_SDPA_WHOLE_SEQUENCE_MAX is noise rather than an approximation,
+     * and saying nothing about it. */
+    int eligible = block && block < sequence && batch == 1 && !causal &&
+                   !headMajor && !outputHeadMajor;
+    if (eligible && row_bytes % 256 != 0 &&
+        sequence > H3_SDPA_WHOLE_SEQUENCE_MAX) {
+        h3_gpu_set_error(gpu, @"SDPA cannot query-block a %zu-byte row "
+                         "(%u heads x %u, not 256-byte aligned) and will not "
+                         "fall back at sequence %u: the whole-sequence encode "
+                         "returns noise above %u, not an approximation. See "
+                         "docs/720p-blocked-attention.md.",
+                         row_bytes, heads, head_dim, sequence,
+                         (unsigned)H3_SDPA_WHOLE_SEQUENCE_MAX);
+        return 0;
+    }
+    int blocked = eligible && row_bytes % 256 == 0;
     if (!blocked) block = sequence;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);

@@ -168,6 +168,50 @@ static size_t sample_rows(uint32_t *rows, size_t capacity) {
     return used;
 }
 
+/* The alignment gate, from both sides. One head of 72 is a 144-byte query row,
+ * so it can never be query-blocked however H3_SDPA_QUERY_BLOCK is set. Below
+ * H3_SDPA_WHOLE_SEQUENCE_MAX the whole-sequence encode is still trustworthy and
+ * must keep working exactly as before; above it, falling back would hand the
+ * caller the degraded kernel's noise with no indication, so h3_gpu_sdpa has to
+ * refuse. Zero-filled inputs: this checks which way the gate swings, not a
+ * number. */
+static void alignment_gate(h3_gpu *gpu) {
+    enum { ODD_HEAD_DIM = 72, BELOW = 4096, ABOVE = 8801 };
+    const uint32_t lengths[] = {BELOW, ABOVE};
+    const int expected[] = {1, 0};
+    const float scale = (float)(1.0 / sqrt((double)ODD_HEAD_DIM));
+    setenv("H3_SDPA_QUERY_BLOCK", "256", 1);
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(*lengths); i++) {
+        const size_t count = (size_t)lengths[i] * ODD_HEAD_DIM;
+        h3_gpu_tensor *q = h3_gpu_tensor_new_bf16(gpu, count);
+        h3_gpu_tensor *k = h3_gpu_tensor_new_bf16(gpu, count);
+        h3_gpu_tensor *v = h3_gpu_tensor_new_bf16(gpu, count);
+        h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, count);
+        char message[512] = "";
+        int began = q && k && v && out && h3_gpu_begin(gpu);
+        int encoded = began && h3_gpu_sdpa_bf16(gpu, out, q, k, v, lengths[i],
+                                                1, ODD_HEAD_DIM, scale);
+        if (!encoded) {
+            const char *why = h3_gpu_error(gpu);
+            snprintf(message, sizeof(message), "%s", why ? why : "(none)");
+        }
+        /* Drain either way: a refusal leaves the command buffer open and
+         * h3_gpu_begin will not open a second one. */
+        if (began && !h3_gpu_submit(gpu)) encoded = 0;
+        printf("unaligned 144-byte row at N=%-5u: %s\n", lengths[i],
+               encoded ? "encoded" : message);
+        require(encoded == expected[i], expected[i] ?
+                "the whole-sequence encode must keep working below the "
+                "threshold" :
+                "an unblockable row stride above the threshold must be "
+                "refused, not silently sent to the whole-sequence encode");
+        h3_gpu_tensor_free(q);
+        h3_gpu_tensor_free(k);
+        h3_gpu_tensor_free(v);
+        h3_gpu_tensor_free(out);
+    }
+}
+
 /* The production shape. Not run by `make test`: H3_SDPA_TARGET=1 asks for it. */
 static void target_case(h3_gpu *gpu) {
     const uint32_t sequence = TARGET_SEQUENCE, heads = TARGET_HEADS;
@@ -385,6 +429,8 @@ int main(void) {
     h3_gpu_tensor_free(query);
     h3_gpu_tensor_free(key);
     h3_gpu_tensor_free(value);
+
+    alignment_gate(gpu);
 
     const char *want_target = getenv("H3_SDPA_TARGET");
     if (want_target && *want_target && strcmp(want_target, "0"))
