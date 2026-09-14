@@ -1,0 +1,40 @@
+clang -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion -D_DARWIN_C_SOURCE -I. -c tests/test_h3.c -o tests/test_h3.o
+clang -o h3_tests tests/test_h3.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -o h3_metal_tests tests/test_metal.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -o h3_bf16_tests tests/test_bf16.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -o h3_tokenizer_tests tests/test_tokenizer.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -o h3_text_tests tests/test_text_metal.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -o h3_audio_gpu_tests tests/test_audio_gpu.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -o h3_real_audio_vae_test tests/test_real_audio_vae.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -o h3_real_audio_encoder_test tests/test_real_audio_encoder.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -o h3_av_mux_test tests/test_av_mux.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion -D_DARWIN_C_SOURCE -I. -c tests/test_lora_fixtures.c -o tests/test_lora_fixtures.o
+clang -o h3_lora_fixture_tests tests/test_lora_fixtures.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -o h3_real_video_encoder_test tests/test_real_video_encoder.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -o h3_real_qwen_vision_test tests/test_real_qwen_vision.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -o h3_real_multimodal_text_test tests/test_real_multimodal_text.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+clang -o h3_real_ref_video_text_test tests/test_real_ref_video_text.o h3.o h3_host.o h3_safetensors.o h3_weights.o h3_text_encoder.o h3_dit_schedule.o h3_dit.o h3_lora.o h3_video_vae.o h3_video_encoder.o h3_audio_vae.o h3_ffmpeg.o h3_terminal.o h3_vision_encoder.o h3_multimodal.o h3_metal.o h3_gpu.o h3_tokenizer.o -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate -licucore -lm
+./h3_tests
+ok: 1784 checks
+./h3_lora_fixture_tests
+ok: 194 checks on 11 synthetic LoRA fixtures
+skip: MLX toy-block fixtures are not installed
+skip: released tokenizer is not installed
+skip: MLX Qwen fixture is not installed
+./h3_audio_gpu_tests
+audio primitive weight norm      max abs 5.960464e-08
+audio primitive Conv1d           max abs 5.960464e-08
+audio primitive ConvTranspose1d  max abs 2.980232e-08
+audio primitive SnakeBeta        max abs 1.192093e-07
+audio primitive scaled add       max abs 0
+audio primitive clip             max abs 0
+ok: native AudioVAE Metal primitives match host references
+skip: released AudioVAE weights/fixture are not installed
+skip: released audio encoder weights/fixture are not installed
+ok: concurrent FFmpeg video/PCM pipes created /tmp/h3-av-mux-test.mp4 (51750 bytes)
+skip: released visual encoder weights/fixture are not installed
+skip: released reference-video encoder fixture is not installed
+skip: released Qwen vision weights/fixture are not installed
+skip: released Qwen video-pair fixture is not installed
+skip: released multimodal Qwen weights/fixture are not installed
+skip: Ref2VA video presentation fixture is not installed

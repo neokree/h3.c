@@ -1,0 +1,34 @@
+./h3_tests
+ok: 1784 checks
+./h3_lora_fixture_tests
+ok: 230 checks on 13 synthetic LoRA fixtures
+./h3_sdpa_blocking_tests
+blocked 256  vs blocked 128 : 0 of 1024000 elements differ
+blocked 384  vs blocked 128 : 0 of 1024000 elements differ
+blocked 512  vs blocked 128 : 0 of 1024000 elements differ
+block 0    vs float64 oracle: rel-L2 0.002614
+block 128  vs float64 oracle: rel-L2 0.002614
+block 256  vs float64 oracle: rel-L2 0.002614
+block 384  vs float64 oracle: rel-L2 0.002614
+block 512  vs float64 oracle: rel-L2 0.002614
+ok: query-blocked SDPA is block-size invariant and matches float64
+skip: MLX toy-block fixtures are not installed
+skip: released tokenizer is not installed
+skip: MLX Qwen fixture is not installed
+./h3_audio_gpu_tests
+audio primitive weight norm      max abs 5.960464e-08
+audio primitive Conv1d           max abs 5.960464e-08
+audio primitive ConvTranspose1d  max abs 2.980232e-08
+audio primitive SnakeBeta        max abs 1.192093e-07
+audio primitive scaled add       max abs 0
+audio primitive clip             max abs 0
+ok: native AudioVAE Metal primitives match host references
+skip: released AudioVAE weights/fixture are not installed
+skip: released audio encoder weights/fixture are not installed
+ok: concurrent FFmpeg video/PCM pipes created /tmp/h3-av-mux-test.mp4 (51750 bytes)
+skip: released visual encoder weights/fixture are not installed
+skip: released reference-video encoder fixture is not installed
+skip: released Qwen vision weights/fixture are not installed
+skip: released Qwen video-pair fixture is not installed
+skip: released multimodal Qwen weights/fixture are not installed
+skip: Ref2VA video presentation fixture is not installed

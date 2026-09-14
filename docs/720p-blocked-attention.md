@@ -1,0 +1,333 @@
+# Query-blocked DiT self-attention
+
+Branch `feat/720p-blocked-attention`. Implements item 1 of `TODO.md`
+(`plan/720p-todo`, commit `b23b49b`): replace the single whole-sequence
+`scaledDotProductAttention` encode with a loop over query blocks, so that
+1280x704 / 124 frames (N = 33,329) can encode at all.
+
+The code works and is measured below. **The byte-identity gate the task set
+could not be met, and could not have been met by any change**, for reasons that
+predate this branch. That is the first section, because it changes how every
+other number here has to be read.
+
+## The correctness gate is void: this pipeline is not reproducible
+
+The gate was: regenerate `outputs/probe-P1.mp4` (640x352, 124 frames,
+`--steps 2 --reuse 1 --layers 50 --seed 42 --ssd-streaming`) and `cmp` it.
+
+| run | attention | bytes | denoise wall | video VAE decode |
+|---|---|---:|---:|---:|
+| `probe-P1` (`measure/720p-baseline`) | whole | 3,474,430 | 153.124 s | 105.744 s |
+| `blk-off` (`H3_SDPA_QUERY_BLOCK=0`) | whole | 3,327,824 | 150.569 s | 104.332 s |
+| `blk-off2` (identical invocation) | whole | 3,404,125 | 148.854 s | 104.029 s |
+| `blk-after` | blocked, 256 | 483,162 | 148.217 s | 104.462 s |
+| `blk-after2` (identical invocation) | blocked, 256 | 479,222 | 163.940 s | 101.578 s |
+
+`blk-off` and `blk-off2` are the **same binary, same flags, same seed, and the
+shipped code path** — `H3_SDPA_QUERY_BLOCK=0` restores the single encode
+exactly. They are not byte-identical to each other, and neither reproduces
+`probe-P1`. The same holds for the two blocked runs.
+
+The variation is in the model, not the container: the **audio** streams differ
+between repeats too (`ffmpeg -map 0:a -f md5`), and audio is decoded from the
+DiT latent by the audio VAE without ever touching the video VAE.
+
+This is canvas-dependent, not universal. `outputs/det-d1.mp4` and
+`outputs/det-d2.mp4` (a determinism pair left in `outputs/` from 2 September,
+small canvas, `video VAE tiles 2x1 at 288 pixels`) **are** byte-identical. So
+the pipeline is reproducible at small canvases and stops being reproducible
+somewhere below 640x352 / 124 frames.
+
+Consequence: a `cmp` against a stored video cannot certify any change to this
+code. It was not a weak gate, it was a gate measuring something that does not
+hold. The root cause of the nondeterminism is **not diagnosed here** and is not
+caused by this branch; it wants its own investigation.
+
+## What replaced the gate: a float64 oracle
+
+`tests/test_sdpa_blocking.c` (runs in 0.8 s, synthesises its own inputs, never
+skips) asks the two questions the `cmp` was meant to ask, against a
+double-precision CPU reference instead of against a stored file:
+
+1. **Does the block boundary change the answer?** No. At block 128, 256, 384
+   and 512, every one of 1,024,000 output elements is bit-identical.
+2. **Is the answer right?** rel-L2 2.61e-3 against float64, for every block
+   size and for the unblocked path alike — the bf16 error floor.
+
+## The whole-sequence encode was already degraded, and blocking fixes it
+
+Sweeping a harness at the DiT's real head shape (56 heads, head_dim 128, bf16)
+against the same float64 oracle:
+
+| N | whole vs float64 | blocked vs float64 | whole vs blocked |
+|---:|---:|---:|---|
+| 4,096 | 2.35e-3 | 2.35e-3 | bit-identical |
+| 8,192 | 2.52e-3 | 2.52e-3 | bit-identical |
+| 8,800 | 2.20e-3 | 2.20e-3 | bit-identical |
+| 8,900 | 2.09e-3 | 2.09e-3 | 1.7% of elements, rel-L2 5.3e-3 |
+| 9,000 | 2.06e-3 | 2.06e-3 | 3.4% of elements, rel-L2 6.5e-3 |
+| 9,100 | **3.05e-2** | 2.07e-3 | 6.8% of elements, rel-L2 1.07e-2 |
+| 9,169 | **3.08e-2** | 2.10e-3 | 6.8% of elements, rel-L2 1.17e-2 |
+| 9,216 | **2.31e-2** | 2.07e-3 | 8.4% of elements, rel-L2 1.02e-2 |
+| 12,000 | **2.69e-2** | 2.41e-3 | 44.0% of elements, rel-L2 2.33e-2 |
+
+### Three thresholds, not one
+
+`scaledDotProductAttention` on this device has **three** size thresholds at 56
+heads, of which only the last was known. They are independent and they arrive
+in this order:
+
+| # | boundary | what happens | status before this work |
+|---|---|---|---|
+| 1 | N ≈ 8,800 | whole-sequence and blocked results stop agreeing in the last bit. Both stay at the bf16 error floor. | unknown, and harmless |
+| 2 | N ≈ 9,100 | whole-sequence error jumps to **10 to 15x the bf16 floor**. Blocked does not move. | **unknown, and not harmless** |
+| 3 | N ≈ 12,370-12,398 (2^33 score elements) | `too large for kernel`, the encode aborts | known; the whole reason this task exists |
+
+Threshold 2 is the consequential one. Between it and threshold 3 there is a
+band — roughly N = 9,100 to 12,390 — where the shipped code does not fail, does
+not warn, and returns an answer an order of magnitude worse than the hardware
+can produce. **640x352 / 124 frames sits inside that band.** So does every
+canvas between it and the abort.
+
+### Why it was never seen
+
+The feasibility study measured blocked-against-unblocked agreement at
+(H=56, N=4,096), (H=56, N=8,192) and (H=8, N=2,048), found them bit-identical,
+and concluded blocking was exact. Every one of those N is a power of two, and
+every one is below threshold 1 — precisely the region where the whole-sequence
+kernel still agrees. The real canvases are not powers of two: 9,169 at
+640x352 / 124f, 33,329 at the target.
+
+It was also invisible to the comparison the study used. Blocked-against-
+unblocked can only say the two differ; it cannot say which is wrong, and the
+natural reading of a difference is that the *new* path introduced it. Only a
+third reference that is neither implementation — here a float64 CPU oracle —
+assigns the error to the right side. That is the method worth keeping from this
+task, independent of query blocking.
+
+The blocked result is block-size invariant and sits at the error floor at every
+N. So the divergence is not blocking perturbing the answer — it is the shipped
+path degrading, and blocking avoiding the degradation.
+
+`probe-P1.mp4` was produced at 640x352 / 124 frames, above the second
+threshold. It is the output of a numerically degraded attention path, which is
+a second reason it is not a reference worth matching.
+
+## Cost of blocking at 640x352 / 124 frames
+
+Nil, within run-to-run noise. Denoise 148.2 s and 163.9 s blocked against
+153.1 s, 150.6 s and 148.9 s unblocked. Video VAE decode 104.5 s and 101.6 s
+blocked against 105.7 s, 104.3 s and 104.0 s unblocked — worth watching because
+this change routes the video VAE's own attention through blocking too, and the
+decoder is 38-40% of wall clock. It did not cost it anything here.
+
+Every structural counter is unchanged against `base-P1`: 102 submissions, 314
+direct, 400 linear, 100 attention, `alloc=0.000GiB`, and 72.495 GiB streamed to
+four decimal places. The SDPA counter deliberately still counts one per
+attention op rather than per block.
+
+## The accuracy collapse is visible, and it is total
+
+The threshold is not a numerical nicety. At 640x352 / 124 frames, `--steps 2`,
+seed 42, **identical in every respect except the attention path**:
+
+| contact sheet | attention | what it shows |
+|---|---|---|
+| `outputs/blk-640-blocked-contact.png` | blocked | a woman, red-orange hair, bangs, drop earring, necklace, hand on chest, black strap top |
+| `outputs/blk-640-whole-contact.png` | whole (shipped) | **checkerboard noise, no subject** |
+| `outputs/blk-probeP1-contact.png` | whole (the gate's reference) | **checkerboard noise, no subject** |
+
+So the difference between the two attention paths at this canvas is the
+difference between a picture and no picture, and `outputs/probe-P1.mp4` — the
+file the correctness gate required this change to reproduce byte-for-byte — is
+noise.
+
+This bears directly on `docs/720p-baseline.md`'s Measurement C, which ran
+640x352 / 124f at `--steps 6` with no LoRA, got checkerboard noise, and
+concluded that six undistilled Euler steps may simply not converge and that a
+distillation LoRA is therefore load-bearing. **That conclusion should be
+re-examined.** Two evaluations on the blocked path converge to a coherent
+subject at the same canvas with no LoRA at all. The checkerboard was the
+degraded attention kernel, not the schedule.
+
+## The 1280x704 / 124-frame probe
+
+`--steps 2 --reuse 1 --layers 50 --seed 42 --ssd-streaming`, no LoRA,
+`logs/blk-720p-probe.log`. N = 33,329.
+
+**It encoded.** This canvas has never produced a frame on this machine; the
+run completed and wrote 124 frames with audio.
+
+| stage | wall |
+|---|---:|
+| Qwen text encoder | 9.153 s |
+| DiT load | 8.808 s |
+| Euler denoise, 2 evaluations | 1158.277 s |
+| audio VAE decoder | 0.508 s |
+| video VAE decoder (6x3 tiles at 288 px, 126 submissions) | 398.306 s |
+| profiled fixed cost | 416.775 s |
+| whole process | 1586 s |
+
+`BF16 SSD stream 72.495 GiB` confirms exactly two evaluations, so
+**579.1 s per denoiser evaluation**.
+
+### Against the predictions
+
+| quantity | predicted | measured |
+|---|---|---|
+| s per evaluation | 774-1290 s (`TODO.md` 1.3) | **579.1 s** — below the optimistic end |
+| max process footprint | ~24 GiB (`docs/720p-baseline.md`), 17-25 GiB (`TODO.md` 1.5) | **11 GB peak, 9,823 MB flat through the denoise** |
+| memory guardrail | the open question | **did not fire** |
+| video VAE decode | 400-500 s, 2.4x downside risk | 398.3 s — at the optimistic edge, no 2.4x |
+
+The footprint is the surprise. It sat at **9,823 MB unchanged from 61 s to
+1,147 s** — the entire denoise — and only rose to 10 and then 11 GB during the
+video VAE decode. For comparison `base-P1` measured **19 GiB at 640x352 /
+124f**. This canvas has **four times the pixels at roughly half the memory**,
+because the quadratic score-tensor term the baseline document attributed the
+growth to is exactly what query blocking removes. Memory was never going to be
+the wall once this landed; it is not close to being one.
+
+`TODO.md` 1.4 argued the attention figure was optimistic by 10-30% because it
+was measured in isolation on an idle GPU for 15 seconds, and ranked thermal
+throttling over a long run as the largest unmeasured risk. Over a 26-minute
+sustained run the real number came in **below** the isolation estimate, not
+above. The isolation harness was pessimistic.
+
+### How many evaluations fit in 90 minutes
+
+579.1 s is **one sample, not a measurement**. Five repeats of the same
+configuration at 640x352 spread 148.2 to 163.9 s, about 10%. Carrying that:
+
+| per evaluation | evaluations in 5400 s |
+|---|---|
+| 521 s (−10%) | 9 |
+| 579 s (measured) | 8 |
+| 637 s (+10%) | 7 |
+
+**Seven to nine.** The turbo LoRA's 4-15 s/evaluation does not move the band.
+The bar the quality ladder had to clear was four, so four fits with roughly
+double the budget to spare: a 4-evaluation run lands at **42 to 49 minutes**.
+
+One assumption to retire: the study treated the video VAE decode as 38-40% of
+wall clock. At this canvas it is 25.1% of this 2-evaluation run and would be
+**14.6% of a 4-evaluation run**, because that share was formed at much smaller
+canvases where the denoise itself was cheap. It is no longer the second-largest
+term.
+
+## The oracle now covers the production canvas
+
+The sweep above stops at N = 12,000. Production runs at N = 33,329, so until now
+the best accuracy check in this tree did not cover the canvas being shipped. It
+does now, under `H3_SDPA_TARGET=1`.
+
+A full float64 reference there is not a memory problem to optimise, it is an
+impossibility: the score matrix alone is `33329^2 * 56 * 8` bytes, **497 GB**.
+Unmasked attention makes every query row's output depend on all of K and V but
+on no other query row, so a subset of query rows can be computed exactly in
+float64 against the **whole** key and value tensors. Sixty-four rows cost under
+a gigabyte, and they are an end-to-end check at the real N rather than a
+scaled-down proxy.
+
+*Which* sixty-four is the design. The only arithmetic blocking adds is one byte
+offset per block, `start * heads * head_dim * item`, so the only bug it can hide
+is an off-by-one at a block edge. The sample is weighted onto boundaries
+accordingly: both rows of nine of them, chosen so that 128, 256, 384 and 512
+each own several and including 33,280 where a 256 run's 49-row tail block
+starts; the first and last rows of the sequence; and the remainder spread evenly
+through block interiors as the control.
+
+| block | rel-L2 | boundary rows | interior rows | rows b-1/b | vs block 128 |
+|---:|---:|---:|---:|---:|---|
+| 128 | 2.228e-3 | 2.216e-3 (20) | 2.234e-3 (44) | 2.203e-3 | baseline |
+| 256 | 2.228e-3 | 2.210e-3 (15) | 2.234e-3 (49) | 2.224e-3 | bit-identical |
+| 384 | 2.228e-3 | 2.215e-3 (8) | 2.230e-3 (56) | 2.223e-3 | bit-identical |
+| 512 | 2.228e-3 | 2.212e-3 (11) | 2.232e-3 (53) | 2.203e-3 | bit-identical |
+
+**2.228e-3 is the bf16 floor, not the 3.0e-2 of the degraded kernel.** The
+collapse does not reach the blocked path at production N. Block-size invariance
+holds across all 238,902,272 output elements: three comparisons, zero differing
+bits.
+
+Boundary rows are nowhere worse than interiors. They are marginally *better*, by
+under 1%, which is noise at this sample size. The `b-1/b` column is the pair of
+rows straddling the **block-0/block-1** edge specifically, the one place where
+`h3_gpu_graph_data`'s offset-zero construction (`initWithMTLBuffer:`) meets its
+offset view (`MPSNDArray`). Those are two different constructions feeding one
+placeholder, and a layout disagreement between them would make block 0 right and
+every block after it wrong — which no blocked-against-unblocked comparison can
+see, because it would be the only difference. Those rows sit at 2.203e-3 to
+2.224e-3, at or below the interior figure in every variant. The concern is
+retired.
+
+Cost: 37.5 s and 5.7 GiB resident for four variants and the oracle, of which
+8.9 s is the CPU building the float64 reference and 6.7 to 6.9 s is each GPU
+encode.
+
+## What the nondeterminism is worth, now that it can be seen
+
+`blk-after` and `blk-after2` are not byte-identical, but their contact sheets
+are the same image: same subject, pose, hair, earring, necklace and hand. On
+the blocked path the run-to-run variation is a fine-detail wobble. On the
+whole-sequence path both runs are noise, so they differ wildly — which is most
+of why the byte difference looked alarming.
+
+It still needs its own investigation, and it still means every A/B at this
+canvas carries an unmeasured per-run spread: absolute verdicts on a single run
+stand, but small differences *between* rungs of a ladder do not.
+
+## MPSGraph's SDPA reproduces itself exactly
+
+The section above predates a measurement that narrows it a long way. The
+standing hypothesis was that SDPA is the only GPU operation in this pipeline
+whose reduction dimension grows with canvas and frame count — every other
+reduction contracts over a fixed model dimension — and that above N ~ 9,000 its
+key-axis reduction is split across units whose completion order, and so whose
+float summation order, is not guaranteed. Query blocking narrows the score
+tensor but always feeds K and V whole, so it leaves the key-axis reduction
+untouched: the hypothesis predicted both paths would be non-reproducible.
+
+Two encodes of the same device tensors, back to back, `memcmp`'d:
+
+| N | path | scores | result |
+|---:|---|---:|---|
+| 4,096 | whole-sequence | 1.75 GiB | bit-reproducible |
+| 4,096 | blocked 256 | 0.11 GiB | bit-reproducible |
+| 12,000 | whole-sequence | 15.02 GiB | bit-reproducible |
+| 12,000 | blocked 256 | 0.32 GiB | bit-reproducible |
+| 33,329 | blocked 256 | 0.89 GiB | bit-reproducible |
+
+Zero differing elements out of 354 million, every shape, both paths — including
+the whole-sequence kernel at N = 12,000, where the accuracy collapse is already
+measured. **The degraded kernel is wrong, but it is not unstable.** The
+hypothesis is refuted for everything this measures.
+
+What it measures is worth being precise about: two encodes inside one process,
+on one command queue, against a graph cache the first one warmed. The observed
+pipeline nondeterminism is between separate `./h3` invocations, where graph
+compilation and kernel selection happen afresh. So this rules out order
+nondeterminism inside a fixed SDPA kernel, and leaves two live candidates —
+cross-process variation in which kernel MPSGraph selects, and something that is
+not SDPA at all. The next measurement is the cheap one: hash the output and
+compare it across two processes.
+
+## Files
+
+- `h3_gpu.m` — `h3_gpu_sdpa`, `h3_gpu_sdpa_graph`, `h3_gpu_graph_data`.
+- `tests/test_sdpa_blocking.c` — the block-invariance and oracle check, at
+  N = 1,000 / 8 heads on every `make test` and at the production
+  N = 33,329 / 56 heads under `H3_SDPA_TARGET=1`.
+- `H3_SDPA_QUERY_BLOCK` — block size, default 256 (0.89 GiB of scores at the
+  target). 0 restores the single whole-sequence encode.
+- `H3_SDPA_TARGET=1` — runs the N = 33,329 oracle and the determinism shapes.
+  59 s, 5.7 GiB resident, **32.6 GiB peak memory footprint** — the peak is the
+  15 GiB score tensor of the whole-sequence encode at N = 12,000, not the target
+  case, which peaks at 5.7 GiB. This is why it is not in `make test`, and why it
+  wants a machine that is actually clear rather than merely idle.
+- `H3_SDPA_WHOLE_SEQUENCE_MAX` (`h3_gpu.m`, 8,800) — above this, a caller whose
+  row stride is not 256-byte aligned, and therefore cannot be query-blocked, is
+  refused with an error rather than falling back. The fallback was free when it
+  was written; now it means handing back the degraded kernel's noise and saying
+  nothing. 8,800 is the last N measured good, not the first measured bad. Every
+  caller today is aligned: DiT 56x128 bf16 = 14,336 B, video VAE 32x64
+  f32 = 8,192 B, vision encoder 16x72 bf16 = 2,304 B.
