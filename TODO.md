@@ -1,5 +1,30 @@
 # 720p plan: how many denoiser evaluations fit in 90 minutes, and what to build
 
+> ## Correction, 2026-09-14: the cost model below is superseded
+>
+> Sections 1.1, 1.3 and 1.4 were written before the blocked-attention path was
+> measured in situ at the target canvas. Their central numbers are wrong and the
+> feasibility verdict that follows from them is wrong.
+>
+> | quantity | this document says | measured at 1280x704 / 124f |
+> |---|---|---|
+> | per denoiser evaluation | 774 to 1290 s | **579.1 s** |
+> | fixed cost | 425 to 525 s | **416.8 s** |
+> | evaluations inside 90 min | about 4 | **7 to 9** |
+> | a 4-evaluation run | 59 to 95 min, marginal | **42 to 49 min** |
+>
+> The in-situ penalty argued in 1.4 does not exist: over a 26-minute sustained
+> run the attention figure came in *below* the isolation estimate, so the
+> isolation harness was pessimistic rather than optimistic. Memory was not the
+> wall either, 9,823 MB flat through the denoise against the 17 to 25 GiB
+> predicted in 1.5, because query blocking removes the quadratic score tensor.
+>
+> The measurement is `docs/720p-blocked-attention.md`.
+>
+> Everything below is kept as written. Section 3, "Rejected", is the part that
+> still earns its place: it records what was already ruled out, so a later
+> round does not re-propose it.
+
 Adversarial review of the twelve-agent feasibility study (six research axes,
 six source-verification agents), scored against the revised objective: **one
 1280x704 / 124-frame generation, native, inside 90 minutes, at output the owner
