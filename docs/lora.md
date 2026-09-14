@@ -42,10 +42,30 @@ suffix, plus `.weight`, minus an optional prefix.
 carry `lora_unet_`. A loader that strips unconditionally finds zero pairs on the
 second kind. All three forms are accepted.
 
+**Flattened names resolve against the checkpoint, never by guessing.**
+Convention B spells the target with underscores, `blocks_24_attn_out_proj` for
+`blocks.24.attn.out_proj`, and where the dots go cannot be derived from the
+underscores: `attn_out_proj` is `attn.out_proj` but `mlp_fc1` is `mlp.fc1`. So
+the loader does not de-flatten. It looks the name up with a comparison that
+reads `.` and `_` as the same separator, over the checkpoint's own target names
+(`h3_weight_find_flattened`). Exact match is tried first, so convention A never
+leaves the path it has always taken. Two targets that flatten alike are
+ambiguous and match nothing; the reference checkpoint flattens its 266
+two-dimensional targets with zero collisions. Once resolved, the pair carries
+the checkpoint's dotted spelling, which is what a site matches on.
+
 **Rank is per pair, never per file.** The upstream turbo has rank 64 on the
 backbone and rank 16 on its AdaLN pairs. It is read from the shape of `A`
 (`[rank, in]`) and `B` (`[out, rank]`); if the two disagree the pair is
 internally inconsistent and the load is fatal.
+
+**Pairs are bf16 or F32**, and an F32 pair is converted on the way to the GPU,
+in the same pass that folds the scale into `A`. The dtype is orthogonal to the
+naming: the corpus correlates them (both convention-B files are F32, all three
+convention-A ones bf16) but that is an accident of the corpus, not a rule. Any
+other dtype is refused by name rather than assumed. F16 is the reason that is a
+check and not an assumption: it is the same width as bf16, so reading it as one
+would pass every length check and produce silent nonsense.
 
 **`.alpha` is the file's own scale**, applied as `alpha/rank` and multiplied by
 the user's strength rather than replaced by it. Absent means 1.0. An `.alpha` in
@@ -271,9 +291,17 @@ recipe's canvas the headroom is ~20 GiB and nothing bites.
 
 Three text outputs, no dashboard.
 
-1. **On activation**: path, rank histogram, applied pair count, AdaLN pair count,
-   resident memory. There is no "skipped pairs" section: an unapplicable pair is
-   fatal and its list comes out of the error, not the report.
+1. **On activation**: path, applied pair count, the convention the file was read
+   under, rank histogram, AdaLN pair count, resident memory. There is no
+   "skipped pairs" section: an unapplicable pair is fatal and its list comes out
+   of the error, not the report.
+
+   The convention is named by its two halves, `convention: lora_down/lora_up`,
+   in the order they are read: the first is the `[rank, in]` half. A letter
+   would not answer the question the field exists for. When a file loads and the
+   render is wrong, whether down and up were read the right way round is the
+   first thing to rule out, and without this the only way to answer it is to
+   reread the loader.
 
    The rank histogram is a compact single line ordered by descending count,
    `ranks: 64 x208, 16 x51`. Not a range (`16-64` hides the bimodality, which is
@@ -335,6 +363,31 @@ disagree, a truncated file, a conversion signature, and AdaLN-named pairs.
 branch is measured against. Numerical agreement is measured, never asserted at a
 threshold tighter than the base matrix multiply's own error: the measured floor,
 rel-L2 1.66e-03, is bf16's, not the branch's.
+
+The reference reads a pair at the precision its file wrote, F32 included, so the
+rounding the shipped path applies on the way to the GPU is measured rather than
+cancelled, the way the strength's own rounding already is.
+
+**F32 pairs do not move the floor.** Measured on bf16-out rel-L2, with the
+control (no delta) at 1.657e-03:
+
+| file | convention | dtype | rank | strength | rel-L2 | delta share |
+|---|---|---|---:|---:|---|---|
+| turbo | A | bf16 | 64 | 100 | 2.302e-03 - 2.359e-03 | 0.9 - 1.8e-02 |
+| mystic | B | F32 | 16 | 2 | 2.363e-03 - 2.439e-03 | 8.2e-02 - 1.7e-01 |
+| mystic | B | F32 | 16 | 3 | 2.381e-03 - 2.479e-03 | 1.2e-01 - 2.5e-01 |
+| anime_v7 | B | F32 | 32 | 100 | 2.440e-03 - 2.623e-03 | 1.8e-01 - 7.0e-01 |
+
+All four sit in one band just above the base GEMM's own error. The F32 to bf16
+conversion contributes nothing measurable on top of it.
+
+**Strength is not comparable across files.** turbo at strength 100 puts the delta
+at 1-2% of the output; mystic at the same strength puts it at **97%**, a regime
+T1's tolerance was never calibrated in and where the run fails on tolerance for
+that reason alone. A file's own `alpha/rank` and the magnitude of its trained
+weights both feed this, so a strength that suits one file says nothing about
+another. The oracle target runs mystic at strength 3 and block 24, that file
+carrying only blocks 24-49.
 
 ## Dead paths on this machine
 

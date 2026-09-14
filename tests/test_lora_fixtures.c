@@ -11,7 +11,7 @@
  * zeros: no test in this file reads a number out of an invented file.
  *
  * The checkpoint is synthesised too. h3_lora_parse resolves every pair against
- * the transformer shard headers, so the eleven fixtures need a shard to be
+ * the transformer shard headers, so the fixtures need a shard to be
  * resolved against: one tiny file carrying the six target names at toy
  * shapes. Real shapes would need the real 62 GB.
  */
@@ -24,6 +24,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#define FIXTURE_COUNT 13
 
 static int checks;
 
@@ -213,7 +215,7 @@ static const fixture_tensor CONVENTION_A_PREFIXED[] = {
     PAIR_B("diffusion_model.blocks.0.attn.out_proj", OUT_OUT)
 };
 
-static void write_all(char paths[11][700]) {
+static void write_all(char paths[FIXTURE_COUNT][700]) {
     static const fixture_tensor bare[] = {
         PAIR_A("blocks.0.attn.qkv_proj", QKV_IN),
         PAIR_B("blocks.0.attn.qkv_proj", QKV_OUT),
@@ -235,10 +237,38 @@ static void write_all(char paths[11][700]) {
         {"blocks.0.mlp.fc1.lora_A.weight", "BF16", 2, {8, FC1_IN}, NULL},
         {"blocks.0.mlp.fc1.lora_B.weight", "BF16", 2, {FC1_OUT, 8}, NULL}
     };
+    /* Convention B as the corpus writes it: lora_down/lora_up, the target
+     * flattened to underscores behind a lora_unet_ prefix, and an .alpha whose
+     * ratio is not 1.0 so a scale read off the wrong sibling key cannot pass.
+     * mlp_fc1 is the two-dot case, and its rank 8 proves the rank is still read
+     * per pair on this convention. */
+    static const float alpha_flat = 8.0f;
     static const fixture_tensor convention_b[] = {
-        {"diffusion_model.blocks.0.attn.qkv_proj.lora_down.weight", "BF16", 2,
+        {"lora_unet_blocks_0_attn_qkv_proj.lora_down.weight", "BF16", 2,
          {4, QKV_IN}, NULL},
-        {"diffusion_model.blocks.0.attn.qkv_proj.lora_up.weight", "BF16", 2,
+        {"lora_unet_blocks_0_attn_qkv_proj.lora_up.weight", "BF16", 2,
+         {QKV_OUT, 4}, NULL},
+        {"lora_unet_blocks_0_attn_qkv_proj.alpha", "F32", 1, {1}, &alpha_flat},
+        {"lora_unet_blocks_0_mlp_fc1.lora_down.weight", "BF16", 2,
+         {8, FC1_IN}, NULL},
+        {"lora_unet_blocks_0_mlp_fc1.lora_up.weight", "BF16", 2,
+         {FC1_OUT, 8}, NULL}
+    };
+    /* The same convention naming a block the checkpoint does not have. A
+     * flattened name that resolves to nothing is unapplicable, the error that
+     * already exists, and never a name h3 guesses the dots back into. */
+    /* F32 pairs. The corpus correlates dtype with convention (both
+     * convention-B files are F32, all three convention-A ones bf16), but that
+     * is an accident of the corpus: this one is convention A, so nothing can
+     * tie the two together by accident. */
+    static const fixture_tensor float32[] = {
+        {"blocks.0.attn.qkv_proj.lora_A.weight", "F32", 2, {4, QKV_IN}, NULL},
+        {"blocks.0.attn.qkv_proj.lora_B.weight", "F32", 2, {QKV_OUT, 4}, NULL}
+    };
+    static const fixture_tensor convention_b_no_target[] = {
+        {"lora_unet_blocks_51_attn_qkv_proj.lora_down.weight", "BF16", 2,
+         {4, QKV_IN}, NULL},
+        {"lora_unet_blocks_51_attn_qkv_proj.lora_up.weight", "BF16", 2,
          {QKV_OUT, 4}, NULL}
     };
     /* Two pairs whose names name nothing in the checkpoint, plus one that
@@ -263,7 +293,7 @@ static void write_all(char paths[11][700]) {
         PAIR_B("final_layer.adaln_proj.linear", ADALN_OUT)
     };
 
-    static const char *const names[11] = {
+    static const char *const names[FIXTURE_COUNT] = {
         "01-convention-a-prefixed.safetensors",
         "02-convention-a-bare.safetensors",
         "03-hybrid-alpha.safetensors",
@@ -274,9 +304,11 @@ static void write_all(char paths[11][700]) {
         "08-incoherent-pair.safetensors",
         "09-truncated.safetensors",
         "10-converted.safetensors",
-        "11-adaln-pairs.safetensors"
+        "11-adaln-pairs.safetensors",
+        "12-convention-b-no-target.safetensors",
+        "13-float32-pairs.safetensors"
     };
-    for (size_t index = 0; index < 11; index++) {
+    for (size_t index = 0; index < FIXTURE_COUNT; index++) {
         path_in(paths[index], 700, names[index]);
     }
 
@@ -303,6 +335,11 @@ static void write_all(char paths[11][700]) {
                   "\"adaln_keys_removed\":\"true\"",
                   CONVENTION_A_PREFIXED, minimal);
     write_fixture(paths[10], NULL, adaln, sizeof(adaln) / sizeof(*adaln));
+    write_fixture(paths[11], NULL, convention_b_no_target,
+                  sizeof(convention_b_no_target) /
+                  sizeof(*convention_b_no_target));
+    write_fixture(paths[12], NULL, float32,
+                  sizeof(float32) / sizeof(*float32));
 }
 
 /* ---- the checks ---- */
@@ -325,9 +362,9 @@ static const h3_lora_pair *find_pair(const h3_lora_adapter *adapter,
 }
 
 /* T3: the parser. Convention A with and without the prefix, alpha/rank as the
- * effective scale, mixed ranks in one file, convention B rejected, and a
- * foreign base_model that warns instead of failing. */
-static void test_parser(char paths[11][700]) {
+ * effective scale, mixed ranks in one file, convention B under its flattened
+ * names, and a foreign base_model that warns instead of failing. */
+static void test_parser(char paths[FIXTURE_COUNT][700]) {
     char summary[512];
 
     for (int variant = 0; variant < 2; variant++) {
@@ -359,11 +396,29 @@ static void test_parser(char paths[11][700]) {
     CHECK(find_pair(mixed, "blocks.0.mlp.fc1")->rank == 8);
     h3_lora_adapter_free(mixed);
 
-    /* one offender, and the message names what h3 does read. */
-    CHECK(parse(paths[4], summary, sizeof(summary)) == NULL);
-    CHECK(strstr(summary, "lora_up/lora_down naming is not supported"));
-    CHECK(line_with("first seen at") != NULL);
-    CHECK(line_with("h3 reads lora_A/lora_B") != NULL);
+    /* Convention B loads, and every pair comes back under the checkpoint's own
+     * dotted spelling: that is what makes a site match one. */
+    h3_lora_adapter *flat = parse(paths[4], summary, sizeof(summary));
+    CHECK(flat != NULL);
+    CHECK(flat->pair_count == 2);
+    const h3_lora_pair *flat_qkv = find_pair(flat, "blocks.0.attn.qkv_proj");
+    CHECK(flat_qkv != NULL);
+    CHECK(flat_qkv->rank == 4 && flat_qkv->in_dim == QKV_IN &&
+          flat_qkv->out_dim == QKV_OUT);
+    CHECK(flat_qkv->scale == 2.0f);   /* alpha 8 over rank 4, on down/up too */
+    CHECK(find_pair(flat, "blocks.0.mlp.fc1") != NULL);
+    CHECK(find_pair(flat, "blocks.0.mlp.fc1")->rank == 8);
+    CHECK(flat->adaln_pair_count == 0);
+    h3_lora_adapter_free(flat);
+
+    /* A flattened name with no target is unapplicable, and the message keeps
+     * the underscores the file wrote rather than guessing the dots back in.
+     * The optional lora_unet_ prefix is stripped, the way diffusion_model. is
+     * on convention A. */
+    CHECK(parse(paths[11], summary, sizeof(summary)) == NULL);
+    CHECK(strstr(summary, "1 pair cannot be applied") != NULL);
+    CHECK(strstr(summary, "1 with no target") != NULL);
+    CHECK(line_with("no target: blocks_51_attn_qkv_proj") != NULL);
 
     /* base_model is informative: a warning, and the load still succeeds. */
     h3_lora_adapter *foreign = parse(paths[5], summary, sizeof(summary));
@@ -377,8 +432,38 @@ static void test_parser(char paths[11][700]) {
     h3_lora_adapter_free(foreign);
 }
 
+/* F32 pairs load and materialise, and the budget counts what they become on
+ * the GPU rather than what they occupy on disk. */
+static void test_float32(char paths[FIXTURE_COUNT][700], h3_gpu *gpu) {
+    char summary[512], error[512];
+
+    h3_lora_adapter *adapter = parse(paths[12], summary, sizeof(summary));
+    CHECK(adapter != NULL);
+    CHECK(adapter->pair_count == 1);
+    CHECK(adapter->pairs[0].rank == 4);
+
+    /* 32 elements in A and 96 in B, resident in bf16: 256 bytes, not the 512
+     * the file spends on them. A budget that counted the disk figure would
+     * refuse runs that fit. */
+    CHECK(adapter->resident_bytes == (4 * QKV_IN + QKV_OUT * 4) * 2);
+
+    /* The materialised branch: the read is where an assumed 16-bit dtype
+     * shows up, as a length the tensor does not have. */
+    h3_lora_entry entry = {adapter, 1.0f};
+    h3_lora_set set = {&entry, 1};
+    h3_lora_site site;
+    error[0] = '\0';
+    CHECK(h3_lora_site_build(&set, gpu, "blocks.0.attn.qkv_proj", &site, error,
+                             sizeof(error)));
+    CHECK(error[0] == '\0');
+    CHECK(site.count == 1);
+    CHECK(site.branches[0].rank == 4);
+    h3_lora_site_free(&site);
+    h3_lora_adapter_free(adapter);
+}
+
 /* T3b: --lora PATH[:STRENGTH] splits on the LAST colon. */
-static void test_command_line(char paths[11][700]) {
+static void test_command_line(char paths[FIXTURE_COUNT][700]) {
     char argument[800];
     const char *tail = NULL;
     h3_lora requested[2];
@@ -440,7 +525,7 @@ static void test_command_line(char paths[11][700]) {
 }
 
 /* T4: rejection and reporting. All three fatal, with distinct messages. */
-static void test_rejection(char paths[11][700]) {
+static void test_rejection(char paths[FIXTURE_COUNT][700]) {
     char summary[512];
 
     /* Both orphans listed, not just the first (H5). */
@@ -466,7 +551,7 @@ static void test_rejection(char paths[11][700]) {
 }
 
 /* T4b: the shape of the report. */
-static void test_report(char paths[11][700]) {
+static void test_report(char paths[FIXTURE_COUNT][700]) {
     char summary[512];
 
     h3_lora_adapter *minimal = parse(paths[0], summary, sizeof(summary));
@@ -477,8 +562,21 @@ static void test_report(char paths[11][700]) {
     CHECK(line != NULL);
     CHECK(strstr(line, "ranks: 4 x2") != NULL);      /* the histogram, not a range */
     CHECK(strstr(line, "AdaLN pairs: 0") != NULL);   /* declared even at zero */
+    /* Which spelling was read. When a file loads but the render is wrong, this
+     * is the first thing to rule out, and naming the two halves answers it
+     * without going back to the source. */
+    CHECK(strstr(line, "convention: lora_A/lora_B") != NULL);
     CHECK(line_with("warning:") == NULL);
     h3_lora_adapter_free(minimal);
+
+    /* The other spelling reports itself, in the order it is read: down is the
+     * [rank, in] half and up the [out, rank] one. */
+    h3_lora_adapter *flat = parse(paths[4], summary, sizeof(summary));
+    CHECK(flat != NULL);
+    capture_reset();
+    h3_lora_emit_report(flat, capture, NULL);
+    CHECK(line_with("convention: lora_down/lora_up") != NULL);
+    h3_lora_adapter_free(flat);
 
     /* The histogram is ordered by descending count, and two ranks in one file
      * come out as two entries. */
@@ -519,15 +617,27 @@ int main(void) {
     }
     atexit(cleanup);
 
-    char paths[11][700];
+    char paths[FIXTURE_COUNT][700];
     write_checkpoint();
     write_all(paths);
 
+    char gpu_error[512];
+    h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", gpu_error,
+                                sizeof(gpu_error));
+    if (!gpu) {
+        fprintf(stderr, "FAIL %s: cannot create a GPU: %s\n", __FILE__,
+                gpu_error);
+        return 1;
+    }
+
     test_parser(paths);
+    test_float32(paths, gpu);
     test_command_line(paths);
     test_rejection(paths);
     test_report(paths);
 
-    printf("ok: %d checks on 11 synthetic LoRA fixtures\n", checks);
+    h3_gpu_free(gpu);
+    printf("ok: %d checks on %d synthetic LoRA fixtures\n", checks,
+           FIXTURE_COUNT);
     return 0;
 }
