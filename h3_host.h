@@ -109,6 +109,15 @@ int h3_reference_image_canvas(int width, int height,
 int h3_reference_video_canvas(int width, int height,
                               int *adapted_w, int *adapted_h);
 
+/* The sigma shifts actually in force, defaulting to the two macros above and
+ * overridable by H3_VIDEO_SHIFT / H3_AUDIO_SHIFT for measuring a turbo LoRA
+ * distilled on a different grid. Both return 0 if the environment asked for an
+ * invalid value, and every caller must refuse to run on 0 rather than fall
+ * back, so video and audio can never disagree about which grid a run is on.
+ * Read these, never the macros. See docs/720p-sigma-schedule.md. */
+double h3_video_sigma_shift(void);
+double h3_audio_sigma_shift(void);
+
 double h3_time_shift_sigma(double sigma, double from_shift, double to_shift);
 double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
 int h3_schedule_build(int steps, h3_sigma_schedule *schedule);
