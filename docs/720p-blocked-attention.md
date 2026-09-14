@@ -71,14 +71,39 @@ against the same float64 oracle:
 | 9,216 | **2.31e-2** | 2.07e-3 | 8.4% of elements, rel-L2 1.02e-2 |
 | 12,000 | **2.69e-2** | 2.41e-3 | 44.0% of elements, rel-L2 2.33e-2 |
 
-Two separate thresholds, both in MPSGraph and neither documented:
+### Three thresholds, not one
 
-- Around N = 8,800 the whole-sequence kernel starts disagreeing with the
-  blocked one in the last bit. Both remain at the bf16 error floor: benign.
-- By N = 9,100 the whole-sequence kernel's error jumps to **10 to 15 times the
-  bf16 floor**. The blocked path does not move. The already-known hard abort
-  (`too large for kernel`, measured between N = 12,370 and N = 12,398 at 56
-  heads, 2^33 elements) is a third, further threshold.
+`scaledDotProductAttention` on this device has **three** size thresholds at 56
+heads, of which only the last was known. They are independent and they arrive
+in this order:
+
+| # | boundary | what happens | status before this work |
+|---|---|---|---|
+| 1 | N ≈ 8,800 | whole-sequence and blocked results stop agreeing in the last bit. Both stay at the bf16 error floor. | unknown, and harmless |
+| 2 | N ≈ 9,100 | whole-sequence error jumps to **10 to 15x the bf16 floor**. Blocked does not move. | **unknown, and not harmless** |
+| 3 | N ≈ 12,370-12,398 (2^33 score elements) | `too large for kernel`, the encode aborts | known; the whole reason this task exists |
+
+Threshold 2 is the consequential one. Between it and threshold 3 there is a
+band — roughly N = 9,100 to 12,390 — where the shipped code does not fail, does
+not warn, and returns an answer an order of magnitude worse than the hardware
+can produce. **640x352 / 124 frames sits inside that band.** So does every
+canvas between it and the abort.
+
+### Why it was never seen
+
+The feasibility study measured blocked-against-unblocked agreement at
+(H=56, N=4,096), (H=56, N=8,192) and (H=8, N=2,048), found them bit-identical,
+and concluded blocking was exact. Every one of those N is a power of two, and
+every one is below threshold 1 — precisely the region where the whole-sequence
+kernel still agrees. The real canvases are not powers of two: 9,169 at
+640x352 / 124f, 33,329 at the target.
+
+It was also invisible to the comparison the study used. Blocked-against-
+unblocked can only say the two differ; it cannot say which is wrong, and the
+natural reading of a difference is that the *new* path introduced it. Only a
+third reference that is neither implementation — here a float64 CPU oracle —
+assigns the error to the right side. That is the method worth keeping from this
+task, independent of query blocking.
 
 The blocked result is block-size invariant and sits at the error floor at every
 N. So the divergence is not blocking perturbing the answer — it is the shipped
@@ -101,11 +126,106 @@ direct, 400 linear, 100 attention, `alloc=0.000GiB`, and 72.495 GiB streamed to
 four decimal places. The SDPA counter deliberately still counts one per
 attention op rather than per block.
 
-## Still unmeasured
+## The accuracy collapse is visible, and it is total
 
-The 1280x704 / 124-frame probe has not been run. Nothing in this document says
-anything about seconds per evaluation at the target, real footprint, or how
-many denoiser evaluations fit in 90 minutes.
+The threshold is not a numerical nicety. At 640x352 / 124 frames, `--steps 2`,
+seed 42, **identical in every respect except the attention path**:
+
+| contact sheet | attention | what it shows |
+|---|---|---|
+| `outputs/blk-640-blocked-contact.png` | blocked | a woman, red-orange hair, bangs, drop earring, necklace, hand on chest, black strap top |
+| `outputs/blk-640-whole-contact.png` | whole (shipped) | **checkerboard noise, no subject** |
+| `outputs/blk-probeP1-contact.png` | whole (the gate's reference) | **checkerboard noise, no subject** |
+
+So the difference between the two attention paths at this canvas is the
+difference between a picture and no picture, and `outputs/probe-P1.mp4` — the
+file the correctness gate required this change to reproduce byte-for-byte — is
+noise.
+
+This bears directly on `docs/720p-baseline.md`'s Measurement C, which ran
+640x352 / 124f at `--steps 6` with no LoRA, got checkerboard noise, and
+concluded that six undistilled Euler steps may simply not converge and that a
+distillation LoRA is therefore load-bearing. **That conclusion should be
+re-examined.** Two evaluations on the blocked path converge to a coherent
+subject at the same canvas with no LoRA at all. The checkerboard was the
+degraded attention kernel, not the schedule.
+
+## The 1280x704 / 124-frame probe
+
+`--steps 2 --reuse 1 --layers 50 --seed 42 --ssd-streaming`, no LoRA,
+`logs/blk-720p-probe.log`. N = 33,329.
+
+**It encoded.** This canvas has never produced a frame on this machine; the
+run completed and wrote 124 frames with audio.
+
+| stage | wall |
+|---|---:|
+| Qwen text encoder | 9.153 s |
+| DiT load | 8.808 s |
+| Euler denoise, 2 evaluations | 1158.277 s |
+| audio VAE decoder | 0.508 s |
+| video VAE decoder (6x3 tiles at 288 px, 126 submissions) | 398.306 s |
+| profiled fixed cost | 416.775 s |
+| whole process | 1586 s |
+
+`BF16 SSD stream 72.495 GiB` confirms exactly two evaluations, so
+**579.1 s per denoiser evaluation**.
+
+### Against the predictions
+
+| quantity | predicted | measured |
+|---|---|---|
+| s per evaluation | 774-1290 s (`TODO.md` 1.3) | **579.1 s** — below the optimistic end |
+| max process footprint | ~24 GiB (`docs/720p-baseline.md`), 17-25 GiB (`TODO.md` 1.5) | **11 GB peak, 9,823 MB flat through the denoise** |
+| memory guardrail | the open question | **did not fire** |
+| video VAE decode | 400-500 s, 2.4x downside risk | 398.3 s — at the optimistic edge, no 2.4x |
+
+The footprint is the surprise. It sat at **9,823 MB unchanged from 61 s to
+1,147 s** — the entire denoise — and only rose to 10 and then 11 GB during the
+video VAE decode. For comparison `base-P1` measured **19 GiB at 640x352 /
+124f**. This canvas has **four times the pixels at roughly half the memory**,
+because the quadratic score-tensor term the baseline document attributed the
+growth to is exactly what query blocking removes. Memory was never going to be
+the wall once this landed; it is not close to being one.
+
+`TODO.md` 1.4 argued the attention figure was optimistic by 10-30% because it
+was measured in isolation on an idle GPU for 15 seconds, and ranked thermal
+throttling over a long run as the largest unmeasured risk. Over a 26-minute
+sustained run the real number came in **below** the isolation estimate, not
+above. The isolation harness was pessimistic.
+
+### How many evaluations fit in 90 minutes
+
+579.1 s is **one sample, not a measurement**. Five repeats of the same
+configuration at 640x352 spread 148.2 to 163.9 s, about 10%. Carrying that:
+
+| per evaluation | evaluations in 5400 s |
+|---|---|
+| 521 s (−10%) | 9 |
+| 579 s (measured) | 8 |
+| 637 s (+10%) | 7 |
+
+**Seven to nine.** The turbo LoRA's 4-15 s/evaluation does not move the band.
+The bar the quality ladder had to clear was four, so four fits with roughly
+double the budget to spare: a 4-evaluation run lands at **42 to 49 minutes**.
+
+One assumption to retire: the study treated the video VAE decode as 38-40% of
+wall clock. At this canvas it is 25.1% of this 2-evaluation run and would be
+**14.6% of a 4-evaluation run**, because that share was formed at much smaller
+canvases where the denoise itself was cheap. It is no longer the second-largest
+term.
+
+## What the nondeterminism is worth, now that it can be seen
+
+`blk-after` and `blk-after2` are not byte-identical, but their contact sheets
+are the same image: same subject, pose, hair, earring, necklace and hand. On
+the blocked path the run-to-run variation is a fine-detail wobble. On the
+whole-sequence path both runs are noise, so they differ wildly — which is most
+of why the byte difference looked alarming.
+
+It still needs its own investigation, and it still means every A/B at this
+canvas carries an unmeasured per-run spread: absolute verdicts on a single run
+stand, but small differences *between* rungs of a ladder do not.
 
 ## Files
 
