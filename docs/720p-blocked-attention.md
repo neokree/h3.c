@@ -215,6 +215,55 @@ wall clock. At this canvas it is 25.1% of this 2-evaluation run and would be
 canvases where the denoise itself was cheap. It is no longer the second-largest
 term.
 
+## The oracle now covers the production canvas
+
+The sweep above stops at N = 12,000. Production runs at N = 33,329, so until now
+the best accuracy check in this tree did not cover the canvas being shipped. It
+does now, under `H3_SDPA_TARGET=1`.
+
+A full float64 reference there is not a memory problem to optimise, it is an
+impossibility: the score matrix alone is `33329^2 * 56 * 8` bytes, **497 GB**.
+Unmasked attention makes every query row's output depend on all of K and V but
+on no other query row, so a subset of query rows can be computed exactly in
+float64 against the **whole** key and value tensors. Sixty-four rows cost under
+a gigabyte, and they are an end-to-end check at the real N rather than a
+scaled-down proxy.
+
+*Which* sixty-four is the design. The only arithmetic blocking adds is one byte
+offset per block, `start * heads * head_dim * item`, so the only bug it can hide
+is an off-by-one at a block edge. The sample is weighted onto boundaries
+accordingly: both rows of nine of them, chosen so that 128, 256, 384 and 512
+each own several and including 33,280 where a 256 run's 49-row tail block
+starts; the first and last rows of the sequence; and the remainder spread evenly
+through block interiors as the control.
+
+| block | rel-L2 | boundary rows | interior rows | rows b-1/b | vs block 128 |
+|---:|---:|---:|---:|---:|---|
+| 128 | 2.228e-3 | 2.216e-3 (20) | 2.234e-3 (44) | 2.203e-3 | baseline |
+| 256 | 2.228e-3 | 2.210e-3 (15) | 2.234e-3 (49) | 2.224e-3 | bit-identical |
+| 384 | 2.228e-3 | 2.215e-3 (8) | 2.230e-3 (56) | 2.223e-3 | bit-identical |
+| 512 | 2.228e-3 | 2.212e-3 (11) | 2.232e-3 (53) | 2.203e-3 | bit-identical |
+
+**2.228e-3 is the bf16 floor, not the 3.0e-2 of the degraded kernel.** The
+collapse does not reach the blocked path at production N. Block-size invariance
+holds across all 238,902,272 output elements: three comparisons, zero differing
+bits.
+
+Boundary rows are nowhere worse than interiors. They are marginally *better*, by
+under 1%, which is noise at this sample size. The `b-1/b` column is the pair of
+rows straddling the **block-0/block-1** edge specifically, the one place where
+`h3_gpu_graph_data`'s offset-zero construction (`initWithMTLBuffer:`) meets its
+offset view (`MPSNDArray`). Those are two different constructions feeding one
+placeholder, and a layout disagreement between them would make block 0 right and
+every block after it wrong — which no blocked-against-unblocked comparison can
+see, because it would be the only difference. Those rows sit at 2.203e-3 to
+2.224e-3, at or below the interior figure in every variant. The concern is
+retired.
+
+Cost: 37.5 s and 5.7 GiB resident for four variants and the oracle, of which
+8.9 s is the CPU building the float64 reference and 6.7 to 6.9 s is each GPU
+encode.
+
 ## What the nondeterminism is worth, now that it can be seen
 
 `blk-after` and `blk-after2` are not byte-identical, but their contact sheets
@@ -227,9 +276,58 @@ It still needs its own investigation, and it still means every A/B at this
 canvas carries an unmeasured per-run spread: absolute verdicts on a single run
 stand, but small differences *between* rungs of a ladder do not.
 
+## MPSGraph's SDPA reproduces itself exactly
+
+The section above predates a measurement that narrows it a long way. The
+standing hypothesis was that SDPA is the only GPU operation in this pipeline
+whose reduction dimension grows with canvas and frame count — every other
+reduction contracts over a fixed model dimension — and that above N ~ 9,000 its
+key-axis reduction is split across units whose completion order, and so whose
+float summation order, is not guaranteed. Query blocking narrows the score
+tensor but always feeds K and V whole, so it leaves the key-axis reduction
+untouched: the hypothesis predicted both paths would be non-reproducible.
+
+Two encodes of the same device tensors, back to back, `memcmp`'d:
+
+| N | path | scores | result |
+|---:|---|---:|---|
+| 4,096 | whole-sequence | 1.75 GiB | bit-reproducible |
+| 4,096 | blocked 256 | 0.11 GiB | bit-reproducible |
+| 12,000 | whole-sequence | 15.02 GiB | bit-reproducible |
+| 12,000 | blocked 256 | 0.32 GiB | bit-reproducible |
+| 33,329 | blocked 256 | 0.89 GiB | bit-reproducible |
+
+Zero differing elements out of 354 million, every shape, both paths — including
+the whole-sequence kernel at N = 12,000, where the accuracy collapse is already
+measured. **The degraded kernel is wrong, but it is not unstable.** The
+hypothesis is refuted for everything this measures.
+
+What it measures is worth being precise about: two encodes inside one process,
+on one command queue, against a graph cache the first one warmed. The observed
+pipeline nondeterminism is between separate `./h3` invocations, where graph
+compilation and kernel selection happen afresh. So this rules out order
+nondeterminism inside a fixed SDPA kernel, and leaves two live candidates —
+cross-process variation in which kernel MPSGraph selects, and something that is
+not SDPA at all. The next measurement is the cheap one: hash the output and
+compare it across two processes.
+
 ## Files
 
 - `h3_gpu.m` — `h3_gpu_sdpa`, `h3_gpu_sdpa_graph`, `h3_gpu_graph_data`.
-- `tests/test_sdpa_blocking.c` — the block-invariance and oracle check.
+- `tests/test_sdpa_blocking.c` — the block-invariance and oracle check, at
+  N = 1,000 / 8 heads on every `make test` and at the production
+  N = 33,329 / 56 heads under `H3_SDPA_TARGET=1`.
 - `H3_SDPA_QUERY_BLOCK` — block size, default 256 (0.89 GiB of scores at the
   target). 0 restores the single whole-sequence encode.
+- `H3_SDPA_TARGET=1` — runs the N = 33,329 oracle and the determinism shapes.
+  59 s, 5.7 GiB resident, **32.6 GiB peak memory footprint** — the peak is the
+  15 GiB score tensor of the whole-sequence encode at N = 12,000, not the target
+  case, which peaks at 5.7 GiB. This is why it is not in `make test`, and why it
+  wants a machine that is actually clear rather than merely idle.
+- `H3_SDPA_WHOLE_SEQUENCE_MAX` (`h3_gpu.m`, 8,800) — above this, a caller whose
+  row stride is not 256-byte aligned, and therefore cannot be query-blocked, is
+  refused with an error rather than falling back. The fallback was free when it
+  was written; now it means handing back the degraded kernel's noise and saying
+  nothing. 8,800 is the last N measured good, not the first measured bad. Every
+  caller today is aligned: DiT 56x128 bf16 = 14,336 B, video VAE 32x64
+  f32 = 8,192 B, vision encoder 16x72 bf16 = 2,304 B.

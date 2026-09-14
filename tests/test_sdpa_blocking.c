@@ -59,8 +59,18 @@ static void require(int condition, const char *what) {
     failures++;
 }
 
-static double seconds_since(clock_t start) {
-    return (double)(clock() - start) / (double)CLOCKS_PER_SEC;
+/* Wall clock, not clock(): almost all of an encode is spent waiting on the GPU,
+ * which costs no CPU time at all. */
+static struct timespec now_monotonic(void) {
+    struct timespec moment;
+    clock_gettime(CLOCK_MONOTONIC, &moment);
+    return moment;
+}
+
+static double seconds_since(struct timespec start) {
+    struct timespec now = now_monotonic();
+    return (double)(now.tv_sec - start.tv_sec) +
+           (double)(now.tv_nsec - start.tv_nsec) / 1e9;
 }
 
 /* One (query row, head) pair of the attention, in double precision. Every
@@ -289,7 +299,7 @@ static void target_case(h3_gpu *gpu) {
     const size_t count = (size_t)sequence * heads * HEAD_DIM;
     const uint32_t sizes[] = {128, 256, 384, 512};
     const size_t variants = sizeof(sizes) / sizeof(*sizes);
-    clock_t started = clock();
+    struct timespec started = now_monotonic();
 
     uint32_t head_list[TARGET_HEADS];
     size_t head_count = 0;
@@ -338,7 +348,7 @@ static void target_case(h3_gpu *gpu) {
 
     /* The oracle depends on the inputs, not on the block size, so it is built
      * once and every variant is scored against it. */
-    clock_t oracle_started = clock();
+    struct timespec oracle_started = now_monotonic();
     for (size_t p = 0; p < probes; p++)
         for (size_t h = 0; h < head_count; h++)
             oracle_row(q_host, k_host, v_host, sequence, heads, rows[p],
@@ -349,7 +359,7 @@ static void target_case(h3_gpu *gpu) {
 
     for (size_t i = 0; i < variants; i++) {
         uint16_t *buffer = i ? current : baseline;
-        clock_t encode_started = clock();
+        struct timespec encode_started = now_monotonic();
         if (!encode(gpu, sizes[i], query, key, value, sequence, heads, buffer)) {
             failures++;
             goto done;
@@ -368,6 +378,14 @@ static void target_case(h3_gpu *gpu) {
 
         double edge_gap = 0.0, edge_norm = 0.0;
         double inner_gap = 0.0, inner_norm = 0.0;
+        /* Rows block-1 and block straddle the block-0/block-1 edge, the only
+         * place where h3_gpu_graph_data's offset-zero construction
+         * (initWithMTLBuffer:) meets its offset view (MPSNDArray). A layout
+         * disagreement between the two would make block 0 right and everything
+         * after it wrong, which no whole-sequence comparison can see, so these
+         * two rows are scored on their own as well as inside the boundary
+         * group. */
+        double first_gap = 0.0, first_norm = 0.0;
         size_t edge_rows = 0;
         for (size_t p = 0; p < probes; p++) {
             int edge = rows[p] % sizes[i] == 0 ||
@@ -381,16 +399,22 @@ static void target_case(h3_gpu *gpu) {
                     double gap = (double)bf16_to_f32(buffer[index]) - want;
                     if (edge) { edge_gap += gap * gap; edge_norm += want * want; }
                     else { inner_gap += gap * gap; inner_norm += want * want; }
+                    if (rows[p] == sizes[i] - 1 || rows[p] == sizes[i]) {
+                        first_gap += gap * gap;
+                        first_norm += want * want;
+                    }
                 }
         }
         double overall = sqrt((edge_gap + inner_gap) / (edge_norm + inner_norm));
         double at_edge = edge_norm > 0.0 ? sqrt(edge_gap / edge_norm) : 0.0;
         double inside = inner_norm > 0.0 ? sqrt(inner_gap / inner_norm) : 0.0;
+        double first = first_norm > 0.0 ? sqrt(first_gap / first_norm) : 0.0;
 
-        printf("block %-4u: rel-L2 %.4g  boundary rows %.4g (%zu)  "
-               "interior %.4g (%zu)  differing %zu  encode %.1f s\n",
+        printf("block %-4u: rel-L2 %.4g  boundary %.4g (%zu)  interior %.4g "
+               "(%zu)  rows %u/%u %.4g  differing %zu  encode %.1f s\n",
                sizes[i], overall, at_edge, edge_rows, inside,
-               probes - edge_rows, differing, encode_seconds);
+               probes - edge_rows, sizes[i] - 1, sizes[i], first, differing,
+               encode_seconds);
 
         /* 2.1e-3 is the bf16 floor; 3.0e-2 is the degraded whole-sequence
          * kernel. Landing near the latter would mean the collapse reaches the
