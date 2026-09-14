@@ -20,13 +20,23 @@ the LoRA author's own published reference sampler computes the sigma grid with
 this axis h3 is the faithful implementation and `simple` is the approximation.
 Nothing needs to change.
 
-The research did, however, turn up a different and more serious question that
-the original one was standing in front of. This LoRA family has two lines: the
-544p checkpoints are distilled at video shift **12**, and the 768p checkpoints
-at video shift **6**. This project renders at 1280x704, which is 768p
-territory. h3 hardcoded 12 with no way to express 6; it no longer does, and
-section 9b is the twenty-minute A/B that settles which one this file wants.
-That is the part worth acting on.
+A scare surfaced along the way and is also closed. Turbo LoRAs for this model
+exist in two lines, and the lightx2v one distills its 768p checkpoints at video
+shift **6** rather than 12, which would have made every 1280x704 render here
+off-trajectory. It does not apply: the 544p/768p split is lightx2v's naming,
+and our file comes from a repository that publishes no resolution variants at
+all. Section 7 has the repository listing that settles it.
+
+Three things worth carrying away beyond the verdict:
+
+- **Section 7** also documents the two shift accessors added while chasing that
+  scare. They stay, because they closed a real latent desync between the video
+  grid and the audio slope correction.
+- **Section 8**: `--reuse` does not rebuild the sigma grid. `--steps 20
+  --reuse 2` walks the 20-step grid at 11 evaluations, not an 11-step grid.
+- **Section 5**: this file ships no `.alpha` tensors, so `strength 1.0` means
+  something 16x larger here than in a lightx2v file at the same nominal
+  strength.
 
 ---
 
@@ -238,6 +248,38 @@ attention and MLP pairs and rank 16 on the 51 AdaLN pairs, no `.alpha` keys,
 covering all 50 blocks plus `token_refiner` and `final_layer`, in convention A
 naming.
 
+### No `.alpha` tensors, and why that makes strength incomparable
+
+**This file contains no `.alpha` tensors at all.** Verified from the header:
+518 tensors, not one of them ending in `.alpha`. The metadata says as much in
+words, `"application": "W_eff = W + lora_B @ lora_A"`, with no `alpha/rank`
+factor anywhere in it, and the model card agrees ("alpha = rank, so no extra
+scaling").
+
+What h3 does with that is in `h3_lora.c`: `pair->scale` is initialised to
+`1.0f` and only replaced by `alpha / rank` when an `.alpha` sibling exists and
+is readable. The final per-pair multiplier is `entry->strength * pair->scale`.
+So for this file, `--lora loras/turbo.safetensors:1.0` applies a multiplier of
+**1.0**.
+
+A lightx2v file at the same nominal strength does not. Their DMD configs
+declare a global `alpha: 8` against rank 128, so `pair->scale` is
+`8 / 128 = 0.0625` and `strength 1.0` applies a multiplier of **0.0625**:
+
+| family | `.alpha` | rank | `pair->scale` | effect of `:1.0` |
+|---|---|---:|---:|---:|
+| larryvrh (this file) | absent | 64 / 16 | 1.0 | 1.0 |
+| lightx2v | 8 | 128 | 0.0625 | 0.0625 |
+
+**Sixteen times apart at the same number on the command line.** This is the
+mechanism behind the project's standing observation that LoRA strength is not
+comparable between files, and it is why a strength tuned against one file says
+nothing about another. Two practical consequences: a strength copied from a
+lightx2v workflow will be far too weak here, and the vendor guidance's
+"strength 1.0" is only meaningful once you know which family it was written
+for. For this file it is written for a multiplier of 1.0, which is what h3
+applies by default.
+
 ### The author's reference sampler, which is the real answer
 
 The metadata is silent, but the model card is not. `larryvrh/MiniMax-H3-Turbo-Lora`
@@ -264,6 +306,30 @@ anywhere in `generate.py`.
 So h3 is not merely compatible with the vendor's `simple`, it matches the
 LoRA author's own reference implementation exactly, including the 1/1000
 quantisation that `simple` has and neither h3 nor `generate.py` does.
+
+**The author's own operating point is six steps, not four.** His shipped
+ComfyUI workflow `minimax_h3_t2v_turbo.json` uses
+`BasicScheduler ['simple', 6, 1]`, with `BasicGuider` and no
+`ModelSamplingSD3` node, so the shift comes from the model default. The file is
+named `4step` and the card calls 4 "the recommended *minimum*" with "4-8 the
+useful range", but what he actually ships a workflow for is 6. The useful
+takeaway is that `--steps 4` is the **floor** of the author's range rather than
+its centre, and the file name is not a recommendation.
+
+**This does not match our own measurement, and the disagreement should not be
+smoothed over.** `docs/720p-schedule-ladder.md` ran exactly this comparison at
+640x352 / 124 frames with this LoRA and found the opposite: R2 (`--steps 6`)
+"buys nothing over" R1 (`--steps 4`) and adds a faint concentric ring to the
+backdrop that R1 does not have, so it recommends 4. And 8 steps has **never
+been measured here** at all: rung R3 (`--steps 8 --reuse 2`) was started and
+killed before completion, and no output or log from it was kept.
+
+So the evidence splits: the author ships a 6-step workflow, our one measurement
+prefers 4, and nobody here has data on 8. Since section 8 shows that only
+`--reuse 1` keeps a run on the distilled grid, and the ladder's R1 and R2 both
+used `--reuse 1`, the comparison was at least made on comparable footing. If a
+future run wants to revisit the step count, R3 is the missing rung and the
+cheap canvas is where to run it.
 
 What is **not** published for this file is the distillation itself: no training
 config, no yaml or json recording the sigma schedule or timestep sampling,
@@ -301,11 +367,15 @@ solver: Comfy-Org picks `res_multistep`, ModelTC picks `euler`, which is h3's
 default. That is a solver difference, not a schedule difference, and section 9c
 explains why it is not worth chasing.
 
-## 7. The question underneath: 768p checkpoints are distilled at shift 6
+## 7. The shift-6 scare, and why it does not apply to this file
 
-The original question assumed one turbo LoRA. There are two lines, and they do
-not share a shift. From `ModelTC/Minimax-H3-Turbo`, which unlike larryvrh's
-repo publishes a training-shift column:
+This section exists because the question "is shift 12 right for this file?"
+looks alarming until you check whose naming scheme the alarm came from. It is
+recorded in full, including the refutation, because someone will re-ask it.
+
+**The concern.** There are two turbo LoRA lines for this model and they do not
+share a shift. From `ModelTC/Minimax-H3-Turbo`, which unlike larryvrh's repo
+publishes a training-shift column:
 
 | checkpoint | train res | training shift video/audio | distill NFE |
 |---|---|---:|---:|
@@ -335,27 +405,60 @@ exactly: for `NFE = 4` at video shift 12 and audio shift 3, video sigma
 `[1, 0.9730, 0.9231, 0.8000] -> 0` and audio sigma
 `[1, 0.9000, 0.7500, 0.5000] -> 0`. Both match this document's tables.
 
-**Where that leaves this project.** The file in use is larryvrh's, and
-larryvrh's own `generate.py` hardcodes shift 12, so shift 12 is the documented
-operating point *for this file* and h3 is on it. The honest caveat is that
-larryvrh publishes no resolution or provenance, so which line his 4-step file
-descends from cannot be read off the header, the metadata, or the card. Two
-readings are consistent with the evidence:
+### Why it does not apply: the 544p/768p split is lightx2v's, not larryvrh's
 
-- His file is the 544p/shift-12 line. Then h3's shift 12 is correct, and the
-  open risk is a **resolution** mismatch at 1280x704, not a schedule one.
-- His file is a 768p checkpoint shipped with a stale reference sampler. Then
-  every run is off-trajectory at shift 12 instead of 6, and quietly so.
+The concern was inherited from the wrong family. **`larryvrh/MiniMax-H3-Turbo-Lora`
+publishes no resolution variants at all.** The full repository listing is:
 
-The first is more likely, since the author would have had to write shift 12
-into his own sampler by mistake. It is not settled, and the difference is not
-small: at 4 steps, shift 12 gives `1.000 / 0.973 / 0.923 / 0.800` while shift 6
-gives `1.000 / 0.947 / 0.857 / 0.667`. That is a much larger gap than anything
-in section 4.
+```
+README.md
+minimax_h3_t2v_turbo.json
+minimax_h3_turbo_4step.safetensors           <- the file in use
+minimax_h3_turbo_4step_ckpt500.safetensors
+minimax_h3_turbo_4step_ckpt850.safetensors
+minimax_h3_turbo_4step_ema.safetensors
+minimax_h3_turbo_4step_ema_ckpt500.safetensors
+minimax_h3_turbo_4step_ema_ckpt850.safetensors
+minimax_h3_turbo_v4_step600.safetensors
+minimax_h3_turbo_v4_step600_ema.safetensors
+```
 
-**h3 can now express shift 6.** It could not when this document was first
-written: `H3_VIDEO_SIGMA_SHIFT` was a `#define` with no override anywhere. Two
-environment variables now exist, added in the same commit as this section:
+He varies exactly three things: step count, checkpoint number, and EMA. There
+is no resolution axis in that repo. The 544p/768p distinction with shift 12
+versus 6 is **lightx2v / ModelTC naming**, where every 768p file carries an
+explicit `_768p_` infix (`minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16`)
+and the untagged files are the 544p line.
+
+So our file cannot descend from a 768p line that does not exist in its
+repository. Add the author's own `generate.py` hardcoding `SHIFT_VIDEO = 12.0`,
+and shift 12 is settled for this file. **The question is closed by provenance,
+not by measurement.** The A/B that previously stood in this section was
+cancelled before it ran; twenty minutes of GPU is better spent elsewhere.
+
+Retained for the next person who wonders: the two candidate grids at 4 steps
+are `1.000 / 0.973 / 0.923 / 0.800` at shift 12 and
+`1.000 / 0.947 / 0.857 / 0.667` at shift 6, a far larger gap than anything in
+section 4. If a future run ever adopts a `_768p_` lightx2v checkpoint, the
+shift must move to 6 with it, and section 7's environment variables are how.
+
+### The shift accessors: a desync fix, with an escape hatch attached
+
+These were built to run the experiment above. The experiment was cancelled and
+they stay anyway, because the thing they fixed on the way is worth more than
+the thing they were for.
+
+**The latent hazard.** The two shifts used to be read from the macros in two
+unrelated places: the schedule builders in `h3_host.c`, and the audio slope
+correction in `h3_dit.c` (`h3_time_shift_slope(sigma, H3_VIDEO_SIGMA_SHIFT,
+H3_AUDIO_SIGMA_SHIFT)`). Any future change that moved the video shift in one
+place without the other would have put the video grid on one shift and the
+audio velocity correction on the 12→3 mapping, producing desynchronised audio
+with no error and no warning. Both now read the same two accessors, so they
+cannot disagree. That fix stands whether or not anyone ever sets a variable.
+
+The escape hatch is the same change seen from the other side: if a future run
+adopts a lightx2v `_768p_` checkpoint, which genuinely does want shift 6, the
+shift moves with it without a rebuild.
 
 | variable | overrides | default |
 |---|---|---:|
@@ -363,13 +466,8 @@ environment variables now exist, added in the same commit as this section:
 | `H3_AUDIO_SHIFT` | audio sigma shift | 3.0 |
 
 Both are read through `h3_video_sigma_shift()` / `h3_audio_sigma_shift()`
-(`h3_host.c`), and **nothing reads the macros directly any more**. That matters
-more than it looks: the audio slope correction in the RES path
-(`h3_dit.c`, `h3_time_shift_slope`) used to take both constants independently
-of the schedule builder, so a half-applied override would have put the video
-grid on one shift and the audio velocity correction on another. Both now come
-from the same two accessors, so video and audio cannot disagree about which
-grid a run is on.
+(`h3_host.c`), and **nothing reads the macros directly any more**, which is the
+fix described above.
 
 Unset, they change nothing: the default 4-step grid is still
 `1.000000, 0.972973, 0.923077, 0.800000, 0` to the last bit, and the existing
@@ -499,123 +597,24 @@ EOF
 
 Expected: `0.00e+00` at 4, 8 and 10 steps, `4.98e-04` at 6.
 
-### 9b. The one that could actually change output quality: shift 12 vs shift 6
+### 9b. The shift A/B: cancelled, not run
 
-This is the experiment worth paying for. Section 7 leaves it genuinely open and
-the sigma gap is large. The code it needed now exists, so it is two runs.
+An A/B of shift 12 against shift 6 at the cheap ladder canvas stood here. It
+was cancelled before it ran, because section 7 settled the question from the
+repository listing instead: larryvrh publishes no resolution variants, so the
+file cannot be from a 768p line. Provenance beat measurement, and the GPU time
+went elsewhere.
 
-**Why the cheap canvas is a valid place to test this.** The thing in question
-is a property of the **LoRA's trained trajectory**, not of the render canvas.
-The sigma grid `h3_serving_schedule_build` produces depends only on the step
-count and the shift: it contains no width, no height, no frame count, and is
-byte-identical at 640x352 and at 1280x704. So if this file was distilled at
-shift 6, it is being queried off-trajectory at *every* canvas, and the defect
-should be visible at the cheap one. The cheap canvas costs about a fortieth of
-the target per evaluation, which is what turns this from a two-hour question
-into a twenty-minute one.
+The reasoning that would have justified the cheap canvas is worth keeping,
+because it applies to any future schedule question here. The sigma grid
+`h3_serving_schedule_build` produces depends only on the step count and the
+shift: no width, no height, no frame count, byte-identical at 640x352 and at
+1280x704. A trained-trajectory mismatch is therefore a property of the LoRA and
+not of the render, so it shows at the cheap canvas, at about a fortieth of the
+target's cost per evaluation. What that design can never establish is how the
+target canvas looks, which is a separate question with its own answer.
 
-The reasoning has one real limit, stated so nobody over-reads the result: it
-establishes **which shift this LoRA wants**, not **how good 1280x704 looks**.
-A null result here means shift 12 is correct and this question is closed; it
-does not license any claim about the target canvas, which has its own
-resolution-mismatch question (section 7) that this experiment does not touch.
-
-Run the pair at the ladder canvas from `docs/720p-schedule-ladder.md`
-(640x352, 124 frames, the same 1.818:1 aspect ratio as the target), same seed,
-nothing changed between them but the shift:
-
-```sh
-make -j8 && \
-for S in 12 6; do \
-  H3_VIDEO_SHIFT=$S ./h3 --profile -d ./MiniMax-H3 \
-    -p "$(cat prompts/01-breath.txt)" \
-    --lora loras/turbo.safetensors \
-    --width 640 --height 352 --frames 124 \
-    --steps 6 --reuse 1 --layers 50 --seed 42 --ssd-streaming \
-    -o outputs/shift-$S.mp4 > logs/shift-$S.log 2>&1; \
-done
-```
-
-Then read the contact sheets rather than the videos:
-
-```sh
-for S in 12 6; do \
-  ffmpeg -v error -i outputs/shift-$S.mp4 \
-    -vf "select='eq(n\,0)+eq(n\,41)+eq(n\,82)+eq(n\,123)',tile=4x1" \
-    -frames:v 1 -y outputs/shift-$S-contact.png; \
-done
-```
-
-Confirm from the logs before comparing anything, because a silently ignored
-override would make the two runs identical and look like a null result:
-
-```sh
-grep "sigma shift" logs/shift-12.log logs/shift-6.log
-```
-
-`logs/shift-12.log` must say `video sigma shift 12 (default)` and
-`logs/shift-6.log` must say `video sigma shift 6 (OVERRIDDEN, ...)`. Both must
-say `audio sigma shift 3 (default)`.
-
-**The grids being compared**, at 6 steps:
-
-| i | shift 12 | shift 6 | delta |
-|--:|---:|---:|---:|
-| 0 | 1.000000 | 1.000000 | 0 |
-| 1 | 0.983607 | 0.967742 | -0.0159 |
-| 2 | 0.960000 | 0.923077 | -0.0369 |
-| 3 | 0.923077 | 0.857143 | -0.0659 |
-| 4 | 0.857143 | 0.750000 | -0.1071 |
-| 5 | 0.705882 | 0.545455 | -0.1604 |
-| 6 | 0 | 0 | 0 |
-
-**What to look for.** Compare the two contact sheets on the failure modes the
-ladder already established as this model's tells when the schedule is wrong,
-in this order:
-
-1. **Structure.** `docs/720p-baseline.md` recorded that a bad low-step schedule
-   here does not degrade gracefully, it produces checkerboard noise with no
-   subject. Any trace of checkerboard or an unformed subject on one side is the
-   whole answer and nothing else needs weighing.
-2. **Background artifacts.** The ladder found a faint concentric ring in R2's
-   flat lavender-grey backdrop that R1 did not have. That backdrop is the most
-   sensitive surface in this prompt. Rings, banding or a woven texture on one
-   side and not the other is the next strongest signal.
-3. **Subject detail.** Earring shape, nail art, lace trim, individual hair
-   strands. The ladder describes these as intact at 4 and 6 evaluations, so
-   softening or mush on one side is meaningful.
-4. **Identity across frames.** Same face at frame 0 and frame 123.
-
-**Decision rule.** If shift 6 is visibly better on any of the first three,
-larryvrh's file is from the 768p line, shift 12 has been wrong all along, and
-both this document and `docs/720p-schedule-ladder.md` need revisiting before
-the 1280x704 run. If shift 12 wins, or the two are indistinguishable, section
-7's first reading holds, shift 12 is correct, and the question is closed.
-
-Cost: two 6-evaluation runs at the cheap canvas, which is exactly the rung R2
-already ran. The shift-12 arm reproduces R2 exactly (same canvas, frames,
-steps, reuse, layers, seed, prompt), so `outputs/ladder-R2-contact.png` is a
-free third data point: if the new shift-12 contact sheet does not match the
-stored R2 one, something other than the shift changed and the comparison is
-void.
-
-Two caveats on reading the result. `01-breath.txt` is nearly static, which the
-ladder already flags as the easiest possible case; if the two sheets are close,
-repeat with `prompts/04-water.txt`, where a trajectory mismatch would show in
-motion before it shows in a held pose. And a **null result is not proof of
-identity**, only evidence that any difference is below what a four-frame
-contact sheet at this canvas resolves.
-
-### 9c. If shift 6 wins
-
-`--steps 4` is what actually ships, not 6. Re-run the winning shift at
-`--steps 4 --reuse 1` before changing anything in
-`docs/720p-schedule-ladder.md`, because that rung is the one the 720p plan
-depends on. The 4-step grids differ by a comparable margin:
-`1.000000 / 0.972973 / 0.923077 / 0.800000` at shift 12 against
-`1.000000 / 0.947368 / 0.857143 / 0.666667` at shift 6.
-
-### 9d. Not worth it yet: the sampler
+### 9c. Not worth it yet: the sampler
 
 The vendor pairs `simple` with `res_multistep`; h3 defaults to Euler. h3's RES
 solver **is not reachable from the CLI**: `h3_dit_denoise` (`h3_dit.c:2930`) is
@@ -639,7 +638,10 @@ Repo, read at `main`:
 - `h3.c:1492` schedule construction, `h3.c:1612` the Euler call
 - `h3_dit.c:2930` `h3_dit_denoise`, the RES path, tests only
 - `MiniMax-H3/FL2VA/model_index.json` `sigma_shift_scales`
-- `loras/turbo.safetensors` safetensors header
+- `loras/turbo.safetensors` safetensors header (518 tensors, no `.alpha`)
+- `h3_lora.c:396-410` alpha handling, `h3_lora.c:905` the final multiplier
+- `docs/720p-schedule-ladder.md` the 4-against-6 measurement, and that 8 was
+  never completed
 
 External, read 2026-09-14:
 
@@ -655,3 +657,11 @@ External, read 2026-09-14:
 - `github.com/ModelTC/Minimax-H3-Turbo` README training-shift table
 - `github.com/ModelTC/LightX2V`, `configs/minimax_h3/dmd/*.json`
 - `minimax3.com/blog/minimax-h3-turbo-steps`
+
+The `larryvrh/MiniMax-H3-Turbo-Lora` repository listing in section 7 comes from
+two captures preserved in this machine's Claude Code transcripts, including the
+session that downloaded the file (2026-09-04,
+`5709120b-3e23-4ece-8ce1-0fe4e73f7fc6`). It is reproduced here because the
+absence of a resolution axis in that listing is what closes the shift question,
+and a listing is not something a future reader can reconstruct from the single
+file on disk.
