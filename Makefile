@@ -85,6 +85,9 @@ h3_semantic_dit_test: tests/test_semantic_dit.o $(LIB_OBJ)
 h3_lora_oracle_test: tests/test_lora_oracle.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_sdpa_blocking_tests: tests/test_sdpa_blocking.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_lora_fixture_tests: tests/test_lora_fixtures.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -109,12 +112,13 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
-	h3_av_mux_test h3_lora_fixture_tests \
+	h3_av_mux_test h3_lora_fixture_tests h3_sdpa_blocking_tests \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test
 
 	./h3_tests
 	./h3_lora_fixture_tests
+	./h3_sdpa_blocking_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
 		./h3_metal_tests misc/fixtures/h3_dit.safetensors; \

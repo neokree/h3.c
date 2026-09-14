@@ -1586,12 +1586,11 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
      * Causal stays whole too, because its mask is built [1, 1, N, N].
      *
      * ponytail: no size threshold, so every row-major caller blocks, the video
-     * VAE decoder included - its score tensor already fits. Splitting its
-     * attention costs encodes for nothing, and the 640x352/124f correctness run
-     * is base-P1's own configuration, so that one run reports the price
-     * directly (denoise 153.124s, video VAE decode 105.744s in logs/base-P1.log
-     * on measure/720p-baseline). Add a threshold only if it shows one.
-     * H3_SDPA_QUERY_BLOCK=0 restores the single encode meanwhile. */
+     * VAE decoder included - its score tensor already fits. Measured at
+     * 640x352/124f against base-P1's own configuration, that costs nothing:
+     * denoise 148.2s against 153.1s, video VAE decode 104.5s against 105.7s,
+     * both inside run-to-run noise. Add a threshold only if a larger canvas
+     * shows one. H3_SDPA_QUERY_BLOCK=0 restores the single encode meanwhile. */
     size_t item = tensor_dtype == H3_GPU_F32 ? sizeof(float) :
                   tensor_dtype == H3_GPU_BF16 ? sizeof(uint16_t) : 1;
     size_t row_bytes = (size_t)heads * head_dim * item;
