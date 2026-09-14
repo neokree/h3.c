@@ -37,7 +37,8 @@
 @property(nonatomic, strong) MPSGraphTensor *key;
 @property(nonatomic, strong) MPSGraphTensor *value;
 @property(nonatomic, strong) MPSGraphTensor *output;
-@property(nonatomic, strong) NSArray<NSNumber *> *inputShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *queryShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *kvShape;
 @property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
 @end
 @implementation H3SDPA
@@ -137,8 +138,20 @@ static H3Tensor *TENSOR(const h3_gpu_tensor *tensor) {
 static MPSGraphTensorData *h3_gpu_graph_data(const h3_gpu_tensor *tensor,
                                              NSArray<NSNumber *> *shape,
                                              MPSDataType data_type,
-                                             int stable) {
+                                             int stable, NSUInteger offset) {
     H3Tensor *object = TENSOR(tensor);
+    if (offset) {
+        /* An offset view must skip the stable cache below: that cache keys on
+         * the tensor object and not on the offset, so two blocks of one buffer
+         * would silently share a single view. initWithMTLBuffer:shape:dataType:
+         * has no offset either, hence MPSNDArray (macOS 15.0+). */
+        MPSNDArrayDescriptor *descriptor =
+            [MPSNDArrayDescriptor descriptorWithDataType:data_type shape:shape];
+        MPSNDArray *view = [[MPSNDArray alloc] initWithBuffer:object.buffer
+                                                       offset:offset
+                                                   descriptor:descriptor];
+        return view ? [[MPSGraphTensorData alloc] initWithMPSNDArray:view] : nil;
+    }
     if (!stable || getenv("H3_DISABLE_GRAPH_DATA_CACHE"))
         return [[MPSGraphTensorData alloc] initWithMTLBuffer:object.buffer
             shape:shape dataType:data_type];
@@ -1445,33 +1458,47 @@ int h3_gpu_qkv_rope_f32(h3_gpu *opaque, h3_gpu_tensor *query,
         });
 }
 
+/* Query-block size for the blocked SDPA loop below. An environment knob rather
+ * than a CLI flag: it is a sweep knob, not a user control. 0 turns blocking
+ * off and restores the single whole-sequence encode. */
+static uint32_t h3_gpu_sdpa_query_block(void) {
+    const char *value = getenv("H3_SDPA_QUERY_BLOCK");
+    if (!value || !*value) return 256;
+    long parsed = strtol(value, NULL, 10);
+    return parsed > 0 && parsed < INT32_MAX ? (uint32_t)parsed : 0;
+}
+
+/* queryRows is the rows of one query block; the key/value axis stays the whole
+ * sequence. The two are equal on the unblocked path. Both are in the cache key,
+ * so the short tail block is a second entry, not a special case. */
 static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
-                                 uint32_t sequence,
+                                 uint32_t sequence, uint32_t queryRows,
                                  uint32_t heads, uint32_t head_dim, float scale,
                                  MPSDataType dataType, int causal,
                                  int headMajor, int outputHeadMajor) {
     @autoreleasepool {
         NSString *cacheKey = [NSString stringWithFormat:
-                              @"%u:%u:%u:%u:%u:%.9g:%d:%d:%d",
-                              (unsigned)dataType, batch, sequence, heads,
-                              head_dim, scale, causal, headMajor,
+                              @"%u:%u:%u:%u:%u:%u:%.9g:%d:%d:%d",
+                              (unsigned)dataType, batch, sequence, queryRows,
+                              heads, head_dim, scale, causal, headMajor,
                               outputHeadMajor];
         H3SDPA *cached = gpu.sdpaCache[cacheKey];
         if (cached) return cached;
         MPSGraph *graph = [[MPSGraph alloc] init];
-        NSArray<NSNumber *> *rowMajorShape =
+        NSArray<NSNumber *> *queryShape = headMajor ?
+            @[@(batch), @(heads), @(queryRows), @(head_dim)] :
+            @[@(batch), @(queryRows), @(heads), @(head_dim)];
+        NSArray<NSNumber *> *kvShape = headMajor ?
+            @[@(batch), @(heads), @(sequence), @(head_dim)] :
             @[@(batch), @(sequence), @(heads), @(head_dim)];
-        NSArray<NSNumber *> *headMajorShape =
-            @[@(batch), @(heads), @(sequence), @(head_dim)];
         NSArray<NSNumber *> *outputShape = outputHeadMajor ?
-            headMajorShape : rowMajorShape;
-        NSArray<NSNumber *> *inputShape = headMajor ?
-            headMajorShape : rowMajorShape;
-        MPSGraphTensor *q = [graph placeholderWithShape:inputShape
+            @[@(batch), @(heads), @(queryRows), @(head_dim)] :
+            @[@(batch), @(queryRows), @(heads), @(head_dim)];
+        MPSGraphTensor *q = [graph placeholderWithShape:queryShape
                                                dataType:dataType name:nil];
-        MPSGraphTensor *k = [graph placeholderWithShape:inputShape
+        MPSGraphTensor *k = [graph placeholderWithShape:kvShape
                                                dataType:dataType name:nil];
-        MPSGraphTensor *v = [graph placeholderWithShape:inputShape
+        MPSGraphTensor *v = [graph placeholderWithShape:kvShape
                                                dataType:dataType name:nil];
         MPSGraphTensor *qt = headMajor ? q :
             [graph transposeTensor:q dimension:1 withDimension:2 name:nil];
@@ -1512,7 +1539,8 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
         result.output = outputHeadMajor ? attention :
             [graph transposeTensor:attention dimension:1 withDimension:2
              name:nil];
-        result.inputShape = inputShape;
+        result.queryShape = queryShape;
+        result.kvShape = kvShape;
         result.outputShape = outputShape;
         gpu.sdpaCache[cacheKey] = result;
         return result;
@@ -1542,32 +1570,73 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_set_error(gpu, @"SDPA tensor dtype mismatch");
         return 0;
     }
-    H3SDPA *cache = h3_gpu_sdpa_graph(gpu, batch, sequence, heads, head_dim,
-                                      scale, mps_dtype, causal, headMajor,
-                                      outputHeadMajor);
-    if (!cache) return 0;
+    /* Query blocking. Softmax normalises along the key axis only, so with no
+     * mask each query block's result is already complete against the whole
+     * K/V: exact, no online rescaling, no running max. It exists because
+     * MPSGraph materialises the full [heads, queryRows, sequence] score
+     * tensor, and at 56 heads that crosses its 2^33-element ceiling somewhere
+     * between N=12370 and N=12398; 1280x704/124f needs N=33329.
+     *
+     * A query block is a contiguous byte range only in the row-major
+     * [batch, sequence, heads, head_dim] layout - head-major makes a
+     * single-head slice contiguous, not an all-heads block. So head-major
+     * inputs and a head-major output both stay on the single whole-sequence
+     * encode. Neither is reachable on a non-M5 device: both come from the NAX
+     * paths behind tensorOpsEnabled, which needs "M5" in the Metal device name.
+     * Causal stays whole too, because its mask is built [1, 1, N, N].
+     *
+     * ponytail: no size threshold, so every row-major caller blocks, the video
+     * VAE decoder included - its score tensor already fits. Splitting its
+     * attention costs encodes for nothing, and the 640x352/124f correctness run
+     * is base-P1's own configuration, so that one run reports the price
+     * directly (denoise 153.124s, video VAE decode 105.744s in logs/base-P1.log
+     * on measure/720p-baseline). Add a threshold only if it shows one.
+     * H3_SDPA_QUERY_BLOCK=0 restores the single encode meanwhile. */
+    size_t item = tensor_dtype == H3_GPU_F32 ? sizeof(float) :
+                  tensor_dtype == H3_GPU_BF16 ? sizeof(uint16_t) : 1;
+    size_t row_bytes = (size_t)heads * head_dim * item;
+    uint32_t block = h3_gpu_sdpa_query_block();
+    int blocked = block && block < sequence && batch == 1 && !causal &&
+                  !headMajor && !outputHeadMajor && row_bytes % 256 == 0;
+    if (!blocked) block = sequence;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
-        MPSGraphTensorData *(^data)(const h3_gpu_tensor *) =
-            ^MPSGraphTensorData *(const h3_gpu_tensor *tensor) {
-                return h3_gpu_graph_data(tensor, cache.inputShape,
-                                         mps_dtype, 0);
-            };
-        NSDictionary *feeds = @{
-            cache.query: data(query), cache.key: data(key), cache.value: data(value)
-        };
-        MPSGraphTensorData *outputData = h3_gpu_graph_data(
-            output, cache.outputShape, mps_dtype, 0);
-        NSDictionary *results = @{cache.output: outputData};
-        @try {
-            [cache.graph encodeToCommandBuffer:command feeds:feeds targetOperations:nil
-                             resultsDictionary:results executionDescriptor:nil];
-        } @catch (NSException *exception) {
-            h3_gpu_set_error(gpu, @"MPSGraph SDPA failed: %@", exception.reason);
-            return 0;
+        for (uint32_t start = 0; start < sequence; start += block) {
+            uint32_t rows = sequence - start < block ? sequence - start : block;
+            H3SDPA *cache = h3_gpu_sdpa_graph(gpu, batch, sequence, rows, heads,
+                                              head_dim, scale, mps_dtype,
+                                              causal, headMajor,
+                                              outputHeadMajor);
+            if (!cache) return 0;
+            NSUInteger offset = (NSUInteger)((size_t)start * row_bytes);
+            /* the offset views are built inside the @try too: MPSNDArray
+             * raises rather than returning nil on a descriptor it dislikes. */
+            @try {
+                NSDictionary *feeds = @{
+                    cache.query: h3_gpu_graph_data(query, cache.queryShape,
+                                                   mps_dtype, 0, offset),
+                    cache.key: h3_gpu_graph_data(key, cache.kvShape,
+                                                 mps_dtype, 0, 0),
+                    cache.value: h3_gpu_graph_data(value, cache.kvShape,
+                                                   mps_dtype, 0, 0)};
+                NSDictionary *results = @{
+                    cache.output: h3_gpu_graph_data(output, cache.outputShape,
+                                                    mps_dtype, 0, offset)};
+                [cache.graph encodeToCommandBuffer:command feeds:feeds
+                                  targetOperations:nil
+                                 resultsDictionary:results
+                               executionDescriptor:nil];
+            } @catch (NSException *exception) {
+                h3_gpu_set_error(gpu, @"MPSGraph SDPA failed at query row %u "
+                                 "of %u: %@", start, sequence,
+                                 exception.reason);
+                return 0;
+            }
         }
         gpu.command = command.rootCommandBuffer;
     }
+    /* One attention op, however many blocks it took: two real-weight tests
+     * assert exact counts here and every historical log is compared on them. */
     h3_gpu_stats stats = gpu.stats;
     stats.mps_sdpa_dispatches++;
     gpu.stats = stats;
@@ -2398,16 +2467,16 @@ static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
         MPSGraphTensorData *input_data = h3_gpu_graph_data(
-            input, linear.inputShape, dataType, 0);
+            input, linear.inputShape, dataType, 0, 0);
         MPSGraphTensorData *weight_data = h3_gpu_graph_data(
-            weight, linear.weightShape, dataType, 1);
+            weight, linear.weightShape, dataType, 1, 0);
         MPSGraphTensorData *output_data = h3_gpu_graph_data(
-            output, linear.outputShape, dataType, 0);
+            output, linear.outputShape, dataType, 0, 0);
         NSMutableDictionary *feeds = [@{linear.input: input_data,
                                          linear.weight: weight_data} mutableCopy];
         if (bias) {
             MPSGraphTensorData *bias_data = h3_gpu_graph_data(
-                bias, linear.biasShape, dataType, 1);
+                bias, linear.biasShape, dataType, 1, 0);
             feeds[linear.bias] = bias_data;
         }
         NSDictionary *results = @{linear.output: output_data};
@@ -2617,13 +2686,13 @@ int h3_gpu_mlp_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
         MPSGraphTensorData *inputData = h3_gpu_graph_data(
-            input, mlp.inputShape, MPSDataTypeBFloat16, 0);
+            input, mlp.inputShape, MPSDataTypeBFloat16, 0, 0);
         MPSGraphTensorData *fc1Data = h3_gpu_graph_data(
-            fc1_weight, mlp.fc1Shape, MPSDataTypeBFloat16, 1);
+            fc1_weight, mlp.fc1Shape, MPSDataTypeBFloat16, 1, 0);
         MPSGraphTensorData *fc2Data = h3_gpu_graph_data(
-            fc2_weight, mlp.fc2Shape, MPSDataTypeBFloat16, 1);
+            fc2_weight, mlp.fc2Shape, MPSDataTypeBFloat16, 1, 0);
         MPSGraphTensorData *outputData = h3_gpu_graph_data(
-            output, mlp.outputShape, MPSDataTypeBFloat16, 0);
+            output, mlp.outputShape, MPSDataTypeBFloat16, 0, 0);
         NSDictionary *feeds = @{mlp.input: inputData,
                                 mlp.fc1Weight: fc1Data,
                                 mlp.fc2Weight: fc2Data};
